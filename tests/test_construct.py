@@ -98,19 +98,27 @@ def _run_forward(config: AlloyConfig, tag: str) -> None:
 
 
 def _run_json_roundtrip(config: AlloyConfig, tag: str) -> None:
-    """Save -> parse -> reconstruct; assert round-trip fidelity and verify
-    that the serialized JSON actually contains section markers.
+    """Serialize -> parse -> reconstruct; verify the JSON uses blank-line
+    group separators and no fake keys, then check round-trip fidelity.
     """
     import json as _json
 
     json_str = config.to_json_string()
+
+    # Blank-line separators (consecutive newlines inside the JSON body)
+    body = json_str.strip()[1:-1]  # strip outer { }
+    blank_line_count = body.count("\n\n")
+    assert blank_line_count >= 2, (
+        f"[{tag}] expected multiple blank-line group separators, got {blank_line_count}"
+    )
+
     raw = _json.loads(json_str)
+    # No marker-style fake keys should appear.
+    for k in raw:
+        assert not k.startswith("_section_"), (
+            f"[{tag}] unexpected _section_* key in output: {k!r}"
+        )
 
-    markers = [k for k in raw if k.startswith("_section_")]
-    assert markers, f"[{tag}] expected _section_* marker keys in JSON, got none"
-
-    # Every key should now fit one of: known config field, section marker, or
-    # inherited PretrainedConfig field. Reconstruct and verify core fields.
     rebuilt = AlloyConfig(**raw)
     for field in ("vocab_size", "hidden_size", "num_hidden_layers",
                   "layer_types", "ffn_types", "rms_norm_unit_offset",
@@ -119,12 +127,7 @@ def _run_json_roundtrip(config: AlloyConfig, tag: str) -> None:
             f"[{tag}] roundtrip mismatch on {field}: "
             f"{getattr(rebuilt, field)!r} != {getattr(config, field)!r}"
         )
-    # Re-emit and confirm no section markers leaked onto the instance
-    for attr in vars(rebuilt):
-        assert not attr.startswith("_section_"), (
-            f"[{tag}] section marker {attr!r} leaked onto config instance"
-        )
-    print(f"[{tag}] JSON roundtrip OK ({len(markers)} section markers)")
+    print(f"[{tag}] JSON roundtrip OK ({blank_line_count} group separators)")
 
 
 def main() -> int:

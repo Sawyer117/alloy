@@ -24,10 +24,11 @@ class AlloyConfig(PretrainedConfig):
     **Human-readable JSON output.**
     Hybrid-architecture configs are inherently field-heavy (one group of hyperparameters
     per token-mixer type, per FFN type, plus cross-cutting shape/norm/rotary settings).
-    ``to_json_string`` reorders and groups fields by owning module and inserts separator
-    keys so a reader of ``config.json`` can see at a glance which parameters belong to
-    which subsystem. The separator keys (prefixed by ``_section_``) round-trip cleanly —
-    ``__init__`` drops them on load.
+    ``to_json_string`` reorders fields by owning module and inserts blank lines between
+    groups so a reader of ``config.json`` sees visually separated blocks (attention,
+    linear attention, MLP, MoE, ...) without any fake "section marker" keys cluttering
+    the file. Blank lines inside a JSON object are valid whitespace, so round-trip
+    through ``save_pretrained`` / ``from_pretrained`` is unchanged.
     """
 
     model_type = "alloy"
@@ -36,40 +37,47 @@ class AlloyConfig(PretrainedConfig):
     # --------------------------------------------------------------------- #
     # Visual grouping for human-readable config.json
     # --------------------------------------------------------------------- #
-    _SECTION_MARKER_PREFIX = "_section_"
-
-    # Ordered (slug, header, field_names) tuples. Anything not listed falls
-    # through into an "other" group at the bottom, so adding a new config field
-    # never silently drops it from the JSON — it just lands in "other" until
+    # Ordered (field_names,) tuples. Anything not listed falls through into a
+    # final "other" block at the bottom, so adding a new config field never
+    # silently drops it from the JSON — it just lands in the last block until
     # the group table is updated.
-    _CONFIG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-        ("meta", "Meta", (
+    _CONFIG_GROUPS: tuple[tuple[str, ...], ...] = (
+        # meta
+        (
             "model_type", "architectures", "torch_dtype", "dtype", "transformers_version",
             "tie_word_embeddings", "use_cache",
             "pad_token_id", "bos_token_id", "eos_token_id", "keys_to_ignore_at_inference",
-        )),
-        ("shape", "Global shape", (
+        ),
+        # global shape
+        (
             "vocab_size", "hidden_size", "num_hidden_layers",
             "max_position_embeddings", "initializer_range", "hidden_act",
-        )),
-        ("arch", "Architecture mix", ("layer_types", "ffn_types")),
-        ("norm", "Norm", ("rms_norm_eps", "rms_norm_unit_offset")),
-        ("rotary", "Rotary", ("rope_parameters",)),
-        ("attention", "Attention", (
+        ),
+        # architecture mix
+        ("layer_types", "ffn_types"),
+        # norm
+        ("rms_norm_eps", "rms_norm_unit_offset"),
+        # rotary
+        ("rope_parameters",),
+        # attention (GQAAttention: full_attention / sliding_attention)
+        (
             "num_attention_heads", "num_key_value_heads", "head_dim",
             "attention_bias", "attention_dropout",
             "attn_output_gate", "sliding_window",
-        )),
-        ("linear_attn", "Linear attention", (
+        ),
+        # linear attention (GatedDeltaNet)
+        (
             "linear_num_key_heads", "linear_num_value_heads",
             "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
-        )),
-        ("mlp", "MLP", ("intermediate_size",)),
-        ("moe", "MoE", (
+        ),
+        # MLP
+        ("intermediate_size",),
+        # MoE
+        (
             "num_experts", "num_experts_per_tok",
             "moe_intermediate_size", "shared_expert_intermediate_size",
             "router_aux_loss_coef",
-        )),
+        ),
     )
 
     def __init__(
@@ -117,10 +125,6 @@ class AlloyConfig(PretrainedConfig):
         router_aux_loss_coef: float = 0.001,
         **kwargs,
     ) -> None:
-        # Drop visual section markers that round-trip through saved config.json
-        for k in [key for key in kwargs if key.startswith(self._SECTION_MARKER_PREFIX)]:
-            kwargs.pop(k)
-
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -197,31 +201,46 @@ class AlloyConfig(PretrainedConfig):
     def to_json_string(self, use_diff: bool = True) -> str:
         """Serialize to JSON with fields grouped by owning module.
 
-        Produces the same information content as the default
-        ``PretrainedConfig.to_json_string`` but reorders keys into the module
-        groups defined by ``_CONFIG_GROUPS`` and inserts ``_section_*`` marker
-        keys between groups. The marker keys are dropped on load by
-        ``__init__``, so ``save_pretrained`` / ``from_pretrained`` round-trips.
+        Reorders keys according to ``_CONFIG_GROUPS`` and post-processes the
+        JSON text to insert a blank line between each group. Blank lines
+        inside a JSON object are valid whitespace, so the output still parses
+        and round-trips through ``save_pretrained`` / ``from_pretrained``
+        unchanged.
         """
         base_dict = json.loads(super().to_json_string(use_diff=use_diff))
+
+        # Reorder: each group's fields, in order, then a final "leftover" block
+        # for anything not covered by the group table.
         ordered: dict = {}
+        first_of_group: list[str] = []
         seen: set[str] = set()
-        for slug, header, field_names in self._CONFIG_GROUPS:
+        for field_names in self._CONFIG_GROUPS:
             group = [(name, base_dict[name]) for name in field_names if name in base_dict]
             if not group:
                 continue
-            ordered[f"{self._SECTION_MARKER_PREFIX}{slug}"] = f"===== {header} ====="
+            first_of_group.append(group[0][0])
             for name, value in group:
                 ordered[name] = value
                 seen.add(name)
 
         leftover = [(k, v) for k, v in base_dict.items() if k not in seen]
         if leftover:
-            ordered[f"{self._SECTION_MARKER_PREFIX}other"] = "===== Other ====="
+            first_of_group.append(leftover[0][0])
             for k, v in leftover:
                 ordered[k] = v
 
-        return json.dumps(ordered, indent=2, sort_keys=False) + "\n"
+        raw = json.dumps(ordered, indent=2, sort_keys=False)
+
+        # Insert a blank line before the first field of every group except the
+        # very first. Match at the root indent level (2 spaces) so nested
+        # object keys with the same name don't accidentally trigger.
+        boundary_prefixes = tuple(f'  "{k}":' for k in first_of_group[1:])
+        out_lines: list[str] = []
+        for line in raw.split("\n"):
+            if boundary_prefixes and line.startswith(boundary_prefixes):
+                out_lines.append("")
+            out_lines.append(line)
+        return "\n".join(out_lines) + "\n"
 
 
 __all__ = ["AlloyConfig"]
