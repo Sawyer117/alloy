@@ -4,6 +4,7 @@ from .loading import (
     build_skeleton,
     empty_cache,
     load_state_dict_from_disk,
+    strip_language_model_prefix,
 )
 from .modeling_alloy import AlloyForCausalLM, AlloyModel, AlloyPreTrainedModel
 
@@ -18,4 +19,5 @@ __all__ = [
     "build_skeleton",
     "empty_cache",
     "load_state_dict_from_disk",
+    "strip_language_model_prefix",
 ]

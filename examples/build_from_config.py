@@ -43,6 +43,7 @@ from alloy import (
     AlloyForCausalLM,
     build_skeleton,
     load_state_dict_from_disk,
+    strip_language_model_prefix,
 )
 
 
@@ -116,9 +117,20 @@ def main() -> None:
         print(f"[3/4] Loading state_dict from {ckpt_dir}")
         sd = load_state_dict_from_disk(
             ckpt_dir,
-            # rotary inv_freq is a non-persistent buffer that we recompute from
-            # config; dropping stray ckpt copies avoids load-time warnings.
-            ignore_patterns=[r".*rotary_emb\.inv_freq$"],
+            ignore_patterns=[
+                # Non-persistent buffer — recomputed from config at RotaryEmbedding.__init__.
+                r".*rotary_emb\.inv_freq$",
+                # Vision / multimodal heads stored in ...ForConditionalGeneration
+                # checkpoints (e.g. Qwen3.5-MoE). Safe no-op for pure text ckpts.
+                r"^model\.visual\.",
+                r"^model\.mtp\.",
+                r"^mtp\.",
+            ],
+            # Strip the model.language_model.* wrapper prefix used by multimodal
+            # ConditionalGeneration checkpoints — HF's from_pretrained does this
+            # automatically via base_model_prefix; raw safetensors reads don't.
+            # No-op for plain ...ForCausalLM checkpoints (Qwen3-4B etc.).
+            key_remap=strip_language_model_prefix,
         )
         result = model.load_state_dict(sd, strict=False)
         print(

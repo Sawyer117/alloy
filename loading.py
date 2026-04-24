@@ -188,9 +188,42 @@ def empty_cache(device: torch.device | str = "cuda") -> None:
     gc.collect()
 
 
+def strip_language_model_prefix(key: str) -> str:
+    """Strip the ``model.language_model.`` prefix HF uses for multimodal wrappers.
+
+    Intended as a ``key_remap`` for :func:`load_state_dict_from_disk` when
+    loading a ``...ForConditionalGeneration`` checkpoint (e.g. Qwen3.5-MoE,
+    Qwen2.5-VL, Llama-4-MM, …) into a text-only ``...ForCausalLM`` — the
+    multimodal checkpoint nests the text backbone under
+    ``model.language_model.*`` to make room for ``model.visual.*`` /
+    ``model.audio.*`` siblings, while the text-only class expects everything
+    directly under ``model.*``. HF's ``from_pretrained`` auto-strips via
+    ``base_model_prefix``; raw safetensors reads need it explicit.
+
+    Safe to apply unconditionally — keys without the prefix pass through.
+
+    Typical use::
+
+        sd = load_state_dict_from_disk(
+            ckpt_dir,
+            ignore_patterns=[
+                r"^model\\.visual\\.",        # vision tower, not in text model
+                r"^model\\.mtp\\.",           # multi-token-prediction head
+                r".*rotary_emb\\.inv_freq$",  # recomputed from config
+            ],
+            key_remap=strip_language_model_prefix,
+        )
+    """
+    prefix = "model.language_model."
+    if key.startswith(prefix):
+        return "model." + key[len(prefix):]
+    return key
+
+
 __all__ = [
     "build_skeleton",
     "build_on_device",
     "load_state_dict_from_disk",
     "empty_cache",
+    "strip_language_model_prefix",
 ]

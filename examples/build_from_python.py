@@ -38,6 +38,7 @@ from alloy import (
     AlloyForCausalLM,
     build_skeleton,
     load_state_dict_from_disk,
+    strip_language_model_prefix,
 )
 
 
@@ -191,7 +192,13 @@ def main() -> None:
         print(f"[3/4] Loading state_dict from {ckpt_dir}")
         sd = load_state_dict_from_disk(
             ckpt_dir,
-            ignore_patterns=[r".*rotary_emb\.inv_freq$"],
+            ignore_patterns=[
+                r".*rotary_emb\.inv_freq$",
+                r"^model\.visual\.",
+                r"^model\.mtp\.",
+                r"^mtp\.",
+            ],
+            key_remap=strip_language_model_prefix,
         )
         result = model.load_state_dict(sd, strict=False)
         print(
