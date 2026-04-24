@@ -97,12 +97,46 @@ def _run_forward(config: AlloyConfig, tag: str) -> None:
     print(f"[{tag}] OK — logits {tuple(out.logits.shape)}, {num_params / 1e6:.2f}M params")
 
 
+def _run_json_roundtrip(config: AlloyConfig, tag: str) -> None:
+    """Save -> parse -> reconstruct; assert round-trip fidelity and verify
+    that the serialized JSON actually contains section markers.
+    """
+    import json as _json
+
+    json_str = config.to_json_string()
+    raw = _json.loads(json_str)
+
+    markers = [k for k in raw if k.startswith("_section_")]
+    assert markers, f"[{tag}] expected _section_* marker keys in JSON, got none"
+
+    # Every key should now fit one of: known config field, section marker, or
+    # inherited PretrainedConfig field. Reconstruct and verify core fields.
+    rebuilt = AlloyConfig(**raw)
+    for field in ("vocab_size", "hidden_size", "num_hidden_layers",
+                  "layer_types", "ffn_types", "rms_norm_unit_offset",
+                  "attn_output_gate", "num_experts"):
+        assert getattr(rebuilt, field) == getattr(config, field), (
+            f"[{tag}] roundtrip mismatch on {field}: "
+            f"{getattr(rebuilt, field)!r} != {getattr(config, field)!r}"
+        )
+    # Re-emit and confirm no section markers leaked onto the instance
+    for attr in vars(rebuilt):
+        assert not attr.startswith("_section_"), (
+            f"[{tag}] section marker {attr!r} leaked onto config instance"
+        )
+    print(f"[{tag}] JSON roundtrip OK ({len(markers)} section markers)")
+
+
 def main() -> int:
     print("Constructing qwen3-like alloy model...")
-    _run_forward(_qwen3_like_config(), "qwen3-like")
+    q3_cfg = _qwen3_like_config()
+    _run_forward(q3_cfg, "qwen3-like")
+    _run_json_roundtrip(q3_cfg, "qwen3-like")
 
     print("Constructing qwen3.5-MoE-like alloy model...")
-    _run_forward(_qwen3_5_moe_like_config(), "qwen3.5-MoE-like")
+    q35_cfg = _qwen3_5_moe_like_config()
+    _run_forward(q35_cfg, "qwen3.5-MoE-like")
+    _run_json_roundtrip(q35_cfg, "qwen3.5-MoE-like")
 
     print("\nAll smoke tests passed.")
     return 0
