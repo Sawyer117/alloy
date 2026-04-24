@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from typing import Callable
+
 import torch
 from torch import nn
+
+# ROPE_INIT_FUNCTIONS maps "linear" / "dynamic" / "yarn" / "longrope" / "llama3"
+# to their inv_freq-computing functions, and dynamic_rope_update is the
+# context-aware rescaling wrapper HF uses on every rotary.forward. Both live
+# in transformers' modeling_rope_utils — a framework-level utility module,
+# not under transformers.models.*, so we import rather than copy.
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -45,13 +54,19 @@ class RotaryEmbedding(nn.Module):
 
     Supports:
       - Default RoPE (qwen3-style, 2D position_ids)
+      - All rope_types registered in ``ROPE_INIT_FUNCTIONS``: linear, dynamic,
+        yarn, longrope, llama3 — dispatched by ``rope_parameters["rope_type"]``
       - Partial rotary via ``rope_parameters["partial_rotary_factor"]``
       - Interleaved mRoPE via ``rope_parameters["mrope_interleaved"]=True`` and
-        ``rope_parameters["mrope_section"]`` (qwen3.5-style).
+        ``rope_parameters["mrope_section"]`` (qwen3.5-style)
 
     The caller passes ``position_ids`` as either a 2D ``[B, T]`` tensor or a
     3D ``[3, B, T]`` tensor (T, H, W for mrope). When mrope is enabled the
     input is auto-expanded to 3D if 2D is provided.
+
+    Class structure mirrors per-model HF rotary classes (``Qwen3RotaryEmbedding``
+    etc.): the ``rope_type == "default"`` path is computed locally; everything
+    else delegates to ``ROPE_INIT_FUNCTIONS[rope_type]``.
     """
 
     inv_freq: torch.Tensor
@@ -64,23 +79,39 @@ class RotaryEmbedding(nn.Module):
         self.mrope_interleaved = bool(rope_params.get("mrope_interleaved", False))
         self.mrope_section = rope_params.get("mrope_section", None)
         self.partial_rotary_factor = float(rope_params.get("partial_rotary_factor", 1.0))
-        self.attention_scaling = 1.0
 
-        base = rope_params.get("rope_theta", 10000.0)
-        head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
-        dim = int(head_dim * self.partial_rotary_factor)
-        # Force even
-        dim = dim - (dim % 2)
-
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
         self.max_seq_len_cached = getattr(config, "max_position_embeddings", 0)
         self.original_max_seq_len = self.max_seq_len_cached
 
+        rope_init_fn: Callable = self._compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    def _compute_default_rope_parameters(config, device=None, seq_len=None):
+        """Default RoPE (qwen3 / qwen3.5 style), supporting partial rotary.
+
+        Signature matches ROPE_INIT_FUNCTIONS entries so we can treat it
+        uniformly in ``__init__``. ``seq_len`` is unused for this type.
+        """
+        del seq_len
+        rope_params = config.rope_parameters or {}
+        base = rope_params.get("rope_theta", 10000.0)
+        partial_rotary_factor = float(rope_params.get("partial_rotary_factor", 1.0))
+        head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial_rotary_factor)
+        dim = dim - (dim % 2)  # force even
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, 1.0
+
     @torch.no_grad()
+    @dynamic_rope_update  # runtime inv_freq rescaling for dynamic / yarn / etc.
     def forward(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.mrope_interleaved:
             return self._forward_mrope(x, position_ids)
