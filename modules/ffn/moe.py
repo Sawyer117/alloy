@@ -51,25 +51,57 @@ class _Experts(nn.Module):
         top_k_index: torch.Tensor,    # [N, K]
         top_k_weights: torch.Tensor,  # [N, K]
     ) -> torch.Tensor:
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        """Batched-matmul MoE forward (matches HF's batched_mm_experts_forward).
 
-        for expert_idx_t in expert_hit:
-            expert_idx = int(expert_idx_t.item())
-            if expert_idx == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = hidden_states[token_idx]
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(
-                0, token_idx, current_hidden_states.to(final_hidden_states.dtype)
-            )
-        return final_hidden_states
+        Flatten the (token, expert_slot) pairs into a single axis S = N*K and
+        run two batched mm's over the gathered per-pair weights, then
+        reshape+sum across K to merge top-k contributions per token. This
+        gives identical math to HF's default ``batched_mm`` dispatch — same
+        accumulation order, same precision behaviour — so bf16 outputs align
+        with HF's reference run, which the prior per-expert Python loop did
+        not (accumulation order differed, adding ~0.5 max-abs drift).
+        """
+        num_tokens, hidden_dim = hidden_states.shape
+        num_top_k = top_k_index.size(-1)
+        device = hidden_states.device
+
+        # Flatten (token, expert_slot) pairs into S
+        token_idx = (
+            torch.arange(num_tokens, device=device)
+            .unsqueeze(1)
+            .expand(-1, num_top_k)
+            .reshape(-1)
+        )                                                  # (S,)
+        expert_ids = top_k_index.reshape(-1)               # (S,)
+        sample_weights = top_k_weights.reshape(-1)         # (S,)
+
+        # Sentinel handling (no-op without expert parallelism, but matches HF)
+        invalid_mask = expert_ids >= self.num_experts
+        expert_ids = expert_ids.clamp(0, self.num_experts - 1)
+
+        # (S, H) — tokens repeated per expert_slot
+        selected_hidden = hidden_states[token_idx]
+
+        # Up projection: (S, 2*I, H) @ (S, H, 1) -> (S, 2*I)
+        sel_gate_up = self.gate_up_proj[expert_ids]
+        proj = torch.bmm(sel_gate_up, selected_hidden.unsqueeze(-1)).squeeze(-1)
+
+        # Gate activation: SwiGLU
+        gate, up = proj.chunk(2, dim=-1)
+        proj = self.act_fn(gate) * up                      # (S, I)
+
+        # Down projection: (S, H, I) @ (S, I, 1) -> (S, H)
+        sel_down = self.down_proj[expert_ids]
+        proj = torch.bmm(sel_down, proj.unsqueeze(-1)).squeeze(-1)
+
+        # Apply router weights and zero out any invalid-expert slots
+        weighted = proj * sample_weights.unsqueeze(-1)     # (S, H)
+        if invalid_mask.any():
+            weighted = weighted.masked_fill(invalid_mask.unsqueeze(-1), 0.0)
+
+        # Merge top-k per token via reshape+sum (order-stable, matches HF)
+        out = weighted.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
+        return out.to(hidden_states.dtype)
 
 
 class _TopKRouter(nn.Module):
