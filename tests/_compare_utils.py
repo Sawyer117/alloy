@@ -1,32 +1,26 @@
 """Shared helpers for large-checkpoint equivalence scripts.
 
-The flow these scripts follow is:
-
-    Phase 1: load HF reference → run forward + greedy generate → save small
-             output tensors to disk → drop the model from memory.
-
-    Phase 2: instantiate our AlloyForCausalLM → stream weights straight from
-             the on-disk safetensors shards (no HF model re-instantiation) →
-             run the identical forward + generate → compare against Phase 1.
-
-This avoids holding two copies of 35B weights in HBM simultaneously.
+The generic building blocks (``build_skeleton``, ``build_on_device``,
+``load_state_dict_from_disk``, ``empty_cache``) now live in
+:mod:`alloy.loading` as public API. This module re-exports them for the
+comparison scripts under ``alloy.tests.gpu`` and adds test-specific
+helpers (``pick_device``, config translators, diff reporters).
 """
 from __future__ import annotations
-
-import contextlib
-import gc
-import json
-import re
-from pathlib import Path
-from typing import Callable, Iterable
 
 import torch
 
 from ..configuration_alloy import AlloyConfig
+from ..loading import (  # noqa: F401  re-exported for back-compat
+    build_on_device,
+    build_skeleton,
+    empty_cache,
+    load_state_dict_from_disk,
+)
 
 
 # ---------------------------------------------------------------------------
-# Device / cache
+# Device selection
 # ---------------------------------------------------------------------------
 
 
@@ -46,162 +40,8 @@ def pick_device(prefer: str | None = None) -> torch.device:
     return torch.device("cpu")
 
 
-def empty_cache(device: torch.device) -> None:
-    """Release unused memory on the given accelerator, best-effort."""
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    elif device.type == "npu":
-        try:
-            torch.npu.empty_cache()
-        except AttributeError:
-            pass
-    gc.collect()
-
-
 # ---------------------------------------------------------------------------
-# Construction helpers
-#
-# Two distinct scenarios, two distinct strategies:
-#
-#   1. "I'm about to load an external checkpoint" — initialization values are
-#      pure waste since they'll be overwritten. Use ``build_skeleton``: skip
-#      ``_init_weights`` entirely, allocate directly in target dtype, leave
-#      tensor storage uninitialized.
-#
-#   2. "I'm training this model from scratch" — initialization must be
-#      correct (matches HF's Qwen3_5Moe: ``_init_weights`` handles Linear/
-#      Embedding/RMSNorm/GatedDeltaNet/Experts/Router per their conventions).
-#      Use ``build_on_device``: keeps the init hook but runs it on the target
-#      accelerator, so ``randn_`` / ``uniform_`` execute on GPU/NPU instead
-#      of single-threaded CPU.
-# ---------------------------------------------------------------------------
-
-
-@contextlib.contextmanager
-def build_skeleton(dtype: torch.dtype):
-    """Construction context for the checkpoint-loading case.
-
-    Allocates the module tree in ``dtype`` with uninitialized tensor storage.
-    The caller is expected to run ``load_state_dict(..., strict=False)``
-    immediately afterwards; any remaining uninit values get overwritten.
-
-    Wins over a naive ``AlloyForCausalLM(cfg).to(dtype)``:
-
-    * ``transformers.no_init_weights`` silences the ``_init_weights`` hook
-      so HF doesn't run ``nn.init.normal_`` across every ``nn.Linear`` /
-      Embedding / MoE expert tensor. For a 35B model this is the single
-      biggest construction cost — billions of Python-level RNG draws.
-    * ``torch.set_default_dtype(dtype)`` makes parameters land directly in
-      the target dtype, removing the post-construction ``.to(dtype)`` memcpy
-      (~70 GB for a 35B bf16 model) and halving peak CPU memory.
-
-    Buffers computed inline in ``__init__`` (e.g. RoPE ``inv_freq``) still
-    materialize correctly — those code paths don't go through the init hook.
-    """
-    try:
-        # transformers v5
-        from transformers.initialization import no_init_weights
-    except ImportError:
-        # transformers v4
-        from transformers.modeling_utils import no_init_weights
-
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        with no_init_weights():
-            yield
-    finally:
-        torch.set_default_dtype(old_dtype)
-
-
-@contextlib.contextmanager
-def build_on_device(dtype: torch.dtype, device: str | torch.device):
-    """Construction context for the from-scratch training case.
-
-    Keeps ``_init_weights`` enabled (correctness matters — dt_bias ones,
-    A_log uniform-log, Experts and router normal, unit-offset RMSNorm zeros,
-    etc.) but runs the whole construction on ``device`` so all the random
-    ops execute on the accelerator. A single-threaded CPU ``randn_`` over
-    a 35B-param MoE stack takes minutes; the same on GPU/NPU is seconds.
-
-    Allocations in ``dtype`` via default-dtype. The caller can leave the
-    model on ``device`` or move it elsewhere after construction.
-    """
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        with torch.device(device):
-            yield
-    finally:
-        torch.set_default_dtype(old_dtype)
-
-
-# Back-compat alias.
-fast_construct_ctx = build_skeleton
-
-
-# ---------------------------------------------------------------------------
-# State-dict streaming from safetensors
-# ---------------------------------------------------------------------------
-
-
-def load_state_dict_from_disk(
-    model_path: str | Path,
-    ignore_patterns: Iterable[str] = (),
-    device: str | torch.device = "cpu",
-    key_remap: Callable[[str], str | None] | None = None,
-) -> dict[str, torch.Tensor]:
-    """Stream a full state_dict from safetensors shards, skipping ignored keys.
-
-    Memory-maps shards so unused tensors aren't materialized in RAM all at once.
-
-    Parameters
-    ----------
-    key_remap : optional callable ``(old_key) -> new_key | None``
-        Applied to every non-ignored key before insertion. Returning ``None``
-        skips the key (same effect as matching an ``ignore_patterns`` entry).
-        Useful when the checkpoint layout (e.g. an HF
-        ``...ForConditionalGeneration`` wrapper that nests the text backbone
-        under ``model.language_model.*``) doesn't match the target model's
-        module tree. HF's own ``from_pretrained`` handles this via
-        ``base_model_prefix``; raw safetensors reads need it done by hand.
-    """
-    from safetensors.torch import load_file
-
-    model_path = Path(model_path)
-    index_file = model_path / "model.safetensors.index.json"
-
-    if index_file.exists():
-        with open(index_file, encoding="utf-8") as f:
-            index = json.load(f)
-        shards = sorted(set(index["weight_map"].values()))
-    else:
-        single = model_path / "model.safetensors"
-        if not single.exists():
-            raise FileNotFoundError(f"No safetensors index or single file in {model_path}")
-        shards = [single.name]
-
-    ignore_re = [re.compile(p) for p in ignore_patterns]
-    device_str = str(device)
-
-    full_sd: dict[str, torch.Tensor] = {}
-    for shard in shards:
-        shard_path = str(model_path / shard)
-        shard_sd = load_file(shard_path, device=device_str)
-        for k, v in shard_sd.items():
-            if any(r.match(k) for r in ignore_re):
-                continue
-            if key_remap is not None:
-                new_k = key_remap(k)
-                if new_k is None:
-                    continue
-                k = new_k
-            full_sd[k] = v
-    return full_sd
-
-
-# ---------------------------------------------------------------------------
-# Config conversion
+# Config conversion (HF qwen3 / qwen3.5 -> AlloyConfig)
 # ---------------------------------------------------------------------------
 
 

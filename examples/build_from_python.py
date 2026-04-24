@@ -1,14 +1,20 @@
 """Example 2 — build an alloy model inline in Python, load a checkpoint, generate.
 
-Same goal as ``build_from_config.py`` but the config is constructed programmatically
-rather than read from a JSON file. This path is the one you use when iterating on
-architectures in a notebook / script — tweak a field, rebuild, rerun.
+Same end-to-end goal as ``build_from_config.py`` but the config is constructed
+programmatically rather than read from a JSON file. This path is the one you
+use when iterating on architectures in a notebook / script — tweak a field,
+rebuild, rerun.
 
 The config is derived at runtime from the target checkpoint's *own* ``config.json``,
 so this script works out-of-the-box with any Qwen3 variant (4B / 8B / 14B / 32B …).
-For a hybrid architecture that doesn't have a ready ckpt, just build the
-``AlloyConfig`` directly with the ``layer_types`` / ``ffn_types`` lists you want and
-skip the load step.
+For a hybrid architecture that doesn't have a ready ckpt, pass ``--toy`` to see
+the build + generate path exercised on a small random-init mix.
+
+This example uses :func:`alloy.build_skeleton` for the checkpoint-loading
+case — skip the wasted CPU ``randn_`` init since ``load_state_dict`` will
+overwrite everything. For a from-scratch training run, swap to
+:func:`alloy.build_on_device` instead; it keeps ``_init_weights`` active and
+runs all allocation + init ops on the accelerator.
 
 Run:
 
@@ -16,8 +22,7 @@ Run:
 
 Or, for a hybrid architecture without a matching ckpt:
 
-    python -m alloy.examples.build_from_python --no-load-ckpt \\
-        --override-layer-types linear_attention,linear_attention,full_attention,...
+    python -m alloy.examples.build_from_python --toy
 """
 from __future__ import annotations
 
@@ -26,10 +31,14 @@ import json
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from alloy import AlloyConfig, AlloyForCausalLM
+from alloy import (
+    AlloyConfig,
+    AlloyForCausalLM,
+    build_skeleton,
+    load_state_dict_from_disk,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -40,13 +49,12 @@ from alloy import AlloyConfig, AlloyForCausalLM
 def build_alloy_config_from_qwen3_hf_dir(ckpt_dir: Path) -> AlloyConfig:
     """Translate a Qwen3 HuggingFace ``config.json`` into an ``AlloyConfig``.
 
-    This is equivalent to writing out every field by hand — it's just reading
-    the values from the checkpoint's own config instead of hard-coding them,
-    so the same code path works for Qwen3-4B, Qwen3-8B, Qwen3-14B, etc.
+    Equivalent to writing every field by hand — it's just reading values from
+    the checkpoint's own config instead of hard-coding them, so the same code
+    path works for Qwen3-4B, Qwen3-8B, Qwen3-14B, etc.
 
-    To express a hybrid architecture, replace the ``layer_types`` / ``ffn_types``
-    assignment below with your own pattern. Everything else (shape, norm style,
-    attention config) stays compatible with the Qwen3 checkpoint.
+    To express a hybrid, replace the ``layer_types`` / ``ffn_types`` assignment
+    below with your own pattern. The rest stays compatible with the Qwen3 ckpt.
     """
     with open(ckpt_dir / "config.json", encoding="utf-8") as f:
         hf_cfg = json.load(f)
@@ -102,7 +110,7 @@ def build_toy_hybrid_config() -> AlloyConfig:
         head_dim=64,
         intermediate_size=2048,
         max_position_embeddings=4096,
-        # 3 linear-attention layers per 1 full-attention layer, MoE FFNs throughout.
+        # 3 linear-attention layers per 1 full-attention layer, MoE FFN throughout.
         layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2,
         ffn_types=["moe"] * num_layers,
         rms_norm_unit_offset=True,
@@ -121,29 +129,6 @@ def build_toy_hybrid_config() -> AlloyConfig:
             "partial_rotary_factor": 0.25,
         },
     )
-
-
-# --------------------------------------------------------------------------- #
-# Weight loading
-# --------------------------------------------------------------------------- #
-
-
-def load_safetensors_shards(ckpt_dir: Path) -> dict:
-    index_file = ckpt_dir / "model.safetensors.index.json"
-    if index_file.exists():
-        with open(index_file, encoding="utf-8") as f:
-            shards = sorted(set(json.load(f)["weight_map"].values()))
-    else:
-        shards = ["model.safetensors"]
-    full_sd: dict = {}
-    for shard_name in shards:
-        full_sd.update(load_file(str(ckpt_dir / shard_name)))
-    return full_sd
-
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 
 
 def main() -> None:
@@ -187,18 +172,27 @@ def main() -> None:
         f"ffn_types[0]={config.ffn_types[0]!r}"
     )
 
-    # ------ 2. instantiate ---------------------------------------------- #
-    print(f"[2/4] Instantiating AlloyForCausalLM on {device} in {dtype}")
-    model = AlloyForCausalLM(config).to(dtype).to(device).eval()
-    model.tie_weights()
+    # ------ 2. build skeleton (no init, directly in target dtype) ------- #
+    print(f"[2/4] Instantiating AlloyForCausalLM skeleton in {dtype}")
+    with build_skeleton(dtype):
+        model = AlloyForCausalLM(config)
+    model.tie_weights()  # alias lm_head for tied-embedding configs
+    model.to(device).eval()
 
     # ------ 3. load weights --------------------------------------------- #
     if args.toy:
-        print("[3/4] Toy mode — skipping weight load (weights are randomly initialized)")
+        print("[3/4] Toy mode — skipping weight load (weights stay uninitialized under no_init)")
+        # Uninitialized bf16 tensors would make forward produce NaN garbage.
+        # Drop to full init here so the plumbing demo produces finite output.
+        print("      re-running _init_weights so the demo forward stays finite")
+        model.apply(model._init_weights)
     else:
         ckpt_dir = Path(args.pretrained)
         print(f"[3/4] Loading state_dict from {ckpt_dir}")
-        sd = load_safetensors_shards(ckpt_dir)
+        sd = load_state_dict_from_disk(
+            ckpt_dir,
+            ignore_patterns=[r".*rotary_emb\.inv_freq$"],
+        )
         result = model.load_state_dict(sd, strict=False)
         print(
             f"      missing={len(result.missing_keys)} "
@@ -208,8 +202,6 @@ def main() -> None:
 
     # ------ 4. generate ------------------------------------------------- #
     if args.toy:
-        # No tokenizer for the toy case — pick random input ids so the
-        # user still sees a forward+generate round-trip.
         print("[4/4] Toy mode — generating from random input ids")
         input_ids = torch.randint(0, config.vocab_size, (1, 8), device=device)
         with torch.no_grad():

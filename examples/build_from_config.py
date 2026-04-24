@@ -7,10 +7,13 @@ instantiates whatever the config says.
 Flow:
 
     1. Read ``configs/qwen3_4b.json`` and parse it into an ``AlloyConfig``.
-    2. Build an ``AlloyForCausalLM`` with that config. Weights are random —
-       the config only describes shape / layer composition, not parameters.
+    2. Build an ``AlloyForCausalLM`` using ``build_skeleton`` — skip ``_init_weights``
+       since we're about to overwrite every parameter anyway. For a 4B model
+       this turns ~30-60 s of CPU ``randn_`` into a few hundred ms of shape
+       allocation. For training from scratch, use ``build_on_device`` instead
+       (keeps init correct, runs it on the accelerator).
     3. Stream real Qwen3-4B ``safetensors`` shards from the ckpt directory
-       and load them into the model.
+       straight into the skeleton via ``load_state_dict_from_disk``.
     4. Tokenize a prompt and run greedy ``generate`` to show a continuation.
 
 Run:
@@ -20,12 +23,11 @@ Run:
 The provided ``qwen3_4b.json`` targets Qwen3-4B's published hparams (36 layers
 of full-attention GQA with tied word embeddings). For a different Qwen3 variant
 (e.g. Qwen3-8B), copy the JSON, adjust ``num_hidden_layers`` / ``hidden_size``
-/ ``intermediate_size`` / etc. to match, and extend the per-layer lists.
+/ ``intermediate_size`` / etc., and extend the per-layer lists.
 
-To explore a hybrid architecture that you *don't* have a pretrained ckpt for,
-the same script also works with ``--no-load-ckpt`` — it will skip the state
-dict loading step and generate from random weights (output will be gibberish
-but the end-to-end pipeline runs, useful for plumbing / debugging).
+Pass ``--no-load-ckpt`` to exercise the build and generation path with random
+weights — useful for plumbing a new hybrid layer_types pattern before you have
+a matching checkpoint.
 """
 from __future__ import annotations
 
@@ -34,51 +36,25 @@ import json
 from pathlib import Path
 
 import torch
-from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from alloy import AlloyConfig, AlloyForCausalLM
-
-
-# --------------------------------------------------------------------------- #
-# Helpers
-# --------------------------------------------------------------------------- #
+from alloy import (
+    AlloyConfig,
+    AlloyForCausalLM,
+    build_skeleton,
+    load_state_dict_from_disk,
+)
 
 
 def load_alloy_config(json_path: Path) -> AlloyConfig:
     """Parse a JSON file into an ``AlloyConfig``.
 
-    Any section markers or commented-out keys are ignored: ``AlloyConfig.__init__``
-    only picks up the fields it knows about and stashes the rest.
+    Unknown keys (e.g. section markers from a human-edited file) are ignored:
+    ``AlloyConfig.__init__`` picks up recognized fields and stashes the rest.
     """
     with open(json_path, encoding="utf-8") as f:
         config_dict = json.load(f)
     return AlloyConfig(**config_dict)
-
-
-def load_safetensors_shards(ckpt_dir: Path) -> dict:
-    """Read all safetensors shards in a HuggingFace-style checkpoint directory.
-
-    Handles both single-file (``model.safetensors``) and sharded
-    (``model-00001-of-00014.safetensors`` + index) layouts. Returns the
-    concatenated ``state_dict``.
-    """
-    index_file = ckpt_dir / "model.safetensors.index.json"
-    if index_file.exists():
-        with open(index_file, encoding="utf-8") as f:
-            shards = sorted(set(json.load(f)["weight_map"].values()))
-    else:
-        shards = ["model.safetensors"]
-
-    full_sd: dict = {}
-    for shard_name in shards:
-        full_sd.update(load_file(str(ckpt_dir / shard_name)))
-    return full_sd
-
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
 
 
 def main() -> None:
@@ -112,7 +88,6 @@ def main() -> None:
     print(f"[1/4] Loading AlloyConfig from {args.config}")
     config = load_alloy_config(Path(args.config))
     # Use eager attention so numerical results are reproducible and hardware-agnostic.
-    # For real training/inference you'd likely leave this unset and let HF auto-pick sdpa / flash.
     config._attn_implementation = "eager"
     print(
         f"      num_hidden_layers={config.num_hidden_layers} "
@@ -120,12 +95,16 @@ def main() -> None:
         f"tie_word_embeddings={config.tie_word_embeddings}"
     )
 
-    # ------ 2. build model ---------------------------------------------- #
-    print(f"[2/4] Instantiating AlloyForCausalLM on {device} in {dtype}")
-    model = AlloyForCausalLM(config).to(dtype).to(device).eval()
-    # For tied-embedding configs this aliases lm_head.weight to model.embed_tokens.weight.
-    # No-op when tie_word_embeddings is False.
+    # ------ 2. build skeleton (no init, directly in target dtype) -------- #
+    print(f"[2/4] Instantiating AlloyForCausalLM skeleton in {dtype}")
+    with build_skeleton(dtype):
+        model = AlloyForCausalLM(config)
+    # build_skeleton runs under no_init_weights, which also bypasses HF's
+    # post-init tie_weights. Do the tie ourselves before loading: the ckpt
+    # only stores model.embed_tokens.weight for tied configs, and lm_head
+    # needs to share that storage to be correct after load.
     model.tie_weights()
+    model.to(device).eval()
 
     # ------ 3. load checkpoint ------------------------------------------ #
     if args.no_load_ckpt:
@@ -135,7 +114,12 @@ def main() -> None:
             parser.error("--pretrained is required unless --no-load-ckpt is passed")
         ckpt_dir = Path(args.pretrained)
         print(f"[3/4] Loading state_dict from {ckpt_dir}")
-        sd = load_safetensors_shards(ckpt_dir)
+        sd = load_state_dict_from_disk(
+            ckpt_dir,
+            # rotary inv_freq is a non-persistent buffer that we recompute from
+            # config; dropping stray ckpt copies avoids load-time warnings.
+            ignore_patterns=[r".*rotary_emb\.inv_freq$"],
+        )
         result = model.load_state_dict(sd, strict=False)
         print(
             f"      missing={len(result.missing_keys)} "
@@ -144,13 +128,12 @@ def main() -> None:
         )
 
     # ------ 4. generate ------------------------------------------------- #
-    tokenizer_path = args.pretrained if args.pretrained is not None else None
-    if tokenizer_path is None:
+    if args.pretrained is None:
         print("[4/4] No tokenizer path (no --pretrained) — done.")
         return
 
     print(f"[4/4] Generating continuation (max_new_tokens={args.max_new_tokens})")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
     inputs = tokenizer(args.prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         output = model.generate(
