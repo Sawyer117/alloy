@@ -127,6 +127,11 @@ def phase_ours(
 
     with build_skeleton(dtype):
         ours = AlloyForCausalLM(alloy_cfg)
+
+    # Re-establish weight tying that no_init_weights (used by build_skeleton)
+    # skipped during post_init. No-op when config.tie_word_embeddings=False.
+    ours.tie_weights()
+
     print(f"[phase-2] streaming state_dict from {pretrained}")
 
     # Qwen3_5MoeForConditionalGeneration stores text-backbone weights under

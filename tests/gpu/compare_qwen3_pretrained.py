@@ -108,6 +108,16 @@ def phase_ours(
 
     with build_skeleton(dtype):
         ours = AlloyForCausalLM(alloy_cfg)
+
+    # build_skeleton runs under no_init_weights, which skips HF's post_init
+    # tie_weights() step. Call it here before load_state_dict so that, for
+    # checkpoints with tie_word_embeddings=True (e.g. Qwen3-4B), lm_head.weight
+    # is aliased to model.embed_tokens.weight. load_state_dict will then fill
+    # both via the single "model.embed_tokens.weight" entry. (load_state_dict
+    # will still report lm_head.weight as missing — harmless, the storage is
+    # correct via the alias.)
+    ours.tie_weights()
+
     print(f"[phase-2] streaming state_dict from {pretrained}")
     sd = load_state_dict_from_disk(
         pretrained,
