@@ -98,7 +98,12 @@ def build_skeleton(dtype: torch.dtype):
     Buffers computed inline in ``__init__`` (e.g. RoPE ``inv_freq``) still
     materialize correctly — those code paths don't go through the init hook.
     """
-    from transformers.modeling_utils import no_init_weights
+    try:
+        # transformers v5
+        from transformers.initialization import no_init_weights
+    except ImportError:
+        # transformers v4
+        from transformers.modeling_utils import no_init_weights
 
     old_dtype = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
