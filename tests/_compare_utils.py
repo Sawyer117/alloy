@@ -13,6 +13,7 @@ This avoids holding two copies of 35B weights in HBM simultaneously.
 """
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import re
@@ -55,6 +56,46 @@ def empty_cache(device: torch.device) -> None:
         except AttributeError:
             pass
     gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Fast PreTrainedModel construction skeleton
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def fast_construct_ctx(dtype: torch.dtype):
+    """Construct a ``PreTrainedModel`` skeleton fast when weights will be
+    overwritten by ``load_state_dict`` right after.
+
+    Combines two savings:
+
+    * ``transformers.no_init_weights``: silences the ``_init_weights`` hook
+      so HF doesn't run ``nn.init.normal_`` on every ``nn.Linear`` /
+      ``Embedding`` / MoE expert tensor. For a 35B model this is the
+      single largest construction cost — on CPU it's billions of RNG draws
+      in a Python-level apply loop.
+    * ``torch.set_default_dtype(dtype)``: allocates parameters directly in
+      the target dtype instead of fp32, removing the post-construction
+      ``.to(dtype)`` copy (~70 GB of memcpy for a 35B bf16 model) and
+      halving peak CPU memory.
+
+    Buffers computed inline in ``__init__`` (e.g. RoPE ``inv_freq``) still
+    materialize correctly because their code paths don't depend on the
+    weight-init hook.
+
+    Parameters are garbage-valued on exit; the caller is expected to
+    immediately load real weights.
+    """
+    from transformers.modeling_utils import no_init_weights
+
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with no_init_weights():
+            yield
+    finally:
+        torch.set_default_dtype(old_dtype)
 
 
 # ---------------------------------------------------------------------------

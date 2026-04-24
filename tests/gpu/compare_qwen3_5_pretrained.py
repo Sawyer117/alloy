@@ -42,6 +42,7 @@ from alloy.tests._compare_utils import (
     diff_logits,
     empty_cache,
     alloy_config_from_qwen3_5_text,
+    fast_construct_ctx,
     load_state_dict_from_disk,
     pick_device,
 )
@@ -124,7 +125,8 @@ def phase_ours(
     alloy_cfg = alloy_config_from_qwen3_5_text(hf_text_cfg)
     alloy_cfg._attn_implementation = "eager"
 
-    ours = AlloyForCausalLM(alloy_cfg).to(dtype)
+    with fast_construct_ctx(dtype):
+        ours = AlloyForCausalLM(alloy_cfg)
     print(f"[phase-2] streaming state_dict from {pretrained}")
 
     # Qwen3_5MoeForConditionalGeneration stores text-backbone weights under
