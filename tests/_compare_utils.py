@@ -59,33 +59,44 @@ def empty_cache(device: torch.device) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Fast PreTrainedModel construction skeleton
+# Construction helpers
+#
+# Two distinct scenarios, two distinct strategies:
+#
+#   1. "I'm about to load an external checkpoint" — initialization values are
+#      pure waste since they'll be overwritten. Use ``build_skeleton``: skip
+#      ``_init_weights`` entirely, allocate directly in target dtype, leave
+#      tensor storage uninitialized.
+#
+#   2. "I'm training this model from scratch" — initialization must be
+#      correct (matches HF's Qwen3_5Moe: ``_init_weights`` handles Linear/
+#      Embedding/RMSNorm/GatedDeltaNet/Experts/Router per their conventions).
+#      Use ``build_on_device``: keeps the init hook but runs it on the target
+#      accelerator, so ``randn_`` / ``uniform_`` execute on GPU/NPU instead
+#      of single-threaded CPU.
 # ---------------------------------------------------------------------------
 
 
 @contextlib.contextmanager
-def fast_construct_ctx(dtype: torch.dtype):
-    """Construct a ``PreTrainedModel`` skeleton fast when weights will be
-    overwritten by ``load_state_dict`` right after.
+def build_skeleton(dtype: torch.dtype):
+    """Construction context for the checkpoint-loading case.
 
-    Combines two savings:
+    Allocates the module tree in ``dtype`` with uninitialized tensor storage.
+    The caller is expected to run ``load_state_dict(..., strict=False)``
+    immediately afterwards; any remaining uninit values get overwritten.
 
-    * ``transformers.no_init_weights``: silences the ``_init_weights`` hook
-      so HF doesn't run ``nn.init.normal_`` on every ``nn.Linear`` /
-      ``Embedding`` / MoE expert tensor. For a 35B model this is the
-      single largest construction cost — on CPU it's billions of RNG draws
-      in a Python-level apply loop.
-    * ``torch.set_default_dtype(dtype)``: allocates parameters directly in
-      the target dtype instead of fp32, removing the post-construction
-      ``.to(dtype)`` copy (~70 GB of memcpy for a 35B bf16 model) and
-      halving peak CPU memory.
+    Wins over a naive ``AlloyForCausalLM(cfg).to(dtype)``:
+
+    * ``transformers.no_init_weights`` silences the ``_init_weights`` hook
+      so HF doesn't run ``nn.init.normal_`` across every ``nn.Linear`` /
+      Embedding / MoE expert tensor. For a 35B model this is the single
+      biggest construction cost — billions of Python-level RNG draws.
+    * ``torch.set_default_dtype(dtype)`` makes parameters land directly in
+      the target dtype, removing the post-construction ``.to(dtype)`` memcpy
+      (~70 GB for a 35B bf16 model) and halving peak CPU memory.
 
     Buffers computed inline in ``__init__`` (e.g. RoPE ``inv_freq``) still
-    materialize correctly because their code paths don't depend on the
-    weight-init hook.
-
-    Parameters are garbage-valued on exit; the caller is expected to
-    immediately load real weights.
+    materialize correctly — those code paths don't go through the init hook.
     """
     from transformers.modeling_utils import no_init_weights
 
@@ -96,6 +107,32 @@ def fast_construct_ctx(dtype: torch.dtype):
             yield
     finally:
         torch.set_default_dtype(old_dtype)
+
+
+@contextlib.contextmanager
+def build_on_device(dtype: torch.dtype, device: str | torch.device):
+    """Construction context for the from-scratch training case.
+
+    Keeps ``_init_weights`` enabled (correctness matters — dt_bias ones,
+    A_log uniform-log, Experts and router normal, unit-offset RMSNorm zeros,
+    etc.) but runs the whole construction on ``device`` so all the random
+    ops execute on the accelerator. A single-threaded CPU ``randn_`` over
+    a 35B-param MoE stack takes minutes; the same on GPU/NPU is seconds.
+
+    Allocations in ``dtype`` via default-dtype. The caller can leave the
+    model on ``device`` or move it elsewhere after construction.
+    """
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    try:
+        with torch.device(device):
+            yield
+    finally:
+        torch.set_default_dtype(old_dtype)
+
+
+# Back-compat alias.
+fast_construct_ctx = build_skeleton
 
 
 # ---------------------------------------------------------------------------
