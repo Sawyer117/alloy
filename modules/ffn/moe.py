@@ -6,6 +6,18 @@ from torch import nn
 
 from transformers.activations import ACT2FN
 
+try:
+    # transformers v5: dispatch decorator that picks between
+    #   grouped_mm (torch._grouped_mm, Hopper+)
+    #   batched_mm (bmm-based, any GPU)
+    #   eager      (the class's own forward — our fallback, see below)
+    # and allows custom backends (e.g. NPU fused MoE kernel) via
+    # ALL_EXPERTS_FUNCTIONS.register("<name>", fn) + setting
+    # config._experts_implementation = "<name>".
+    from transformers.integrations.moe import use_experts_implementation
+except ImportError:  # transformers v4 — no dispatch system, we just run our forward
+    use_experts_implementation = None
+
 from ..registry import register_ffn
 
 
@@ -34,6 +46,24 @@ class _Experts(nn.Module):
     Weights:
       gate_up_proj : [num_experts, 2*intermediate, hidden]
       down_proj    : [num_experts, hidden, intermediate]
+
+    Forward dispatch:
+      On transformers v5, this class is wrapped by
+      ``@use_experts_implementation`` (see end of file), which routes ``forward``
+      through ``ALL_EXPERTS_FUNCTIONS`` based on ``config._experts_implementation``:
+
+        * ``grouped_mm`` (default on modern GPU): torch._grouped_mm fused kernel
+        * ``batched_mm``: bmm-based batched path, available on any GPU
+        * ``eager`` / unavailable backend: falls through to the forward defined
+          below, which is itself a batched-bmm implementation — so the "eager"
+          fallback is still fast on any device.
+
+      Custom backends (including a future NPU fused MoE) can be plugged in without
+      modifying alloy:
+
+          from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+          ALL_EXPERTS_FUNCTIONS.register("npu_fused_moe", my_fn)
+          config._experts_implementation = "npu_fused_moe"
     """
 
     def __init__(self, config) -> None:
@@ -51,21 +81,20 @@ class _Experts(nn.Module):
         top_k_index: torch.Tensor,    # [N, K]
         top_k_weights: torch.Tensor,  # [N, K]
     ) -> torch.Tensor:
-        """Batched-matmul MoE forward (matches HF's batched_mm_experts_forward).
+        """Eager-path batched forward.
 
-        Flatten the (token, expert_slot) pairs into a single axis S = N*K and
-        run two batched mm's over the gathered per-pair weights, then
-        reshape+sum across K to merge top-k contributions per token. This
-        gives identical math to HF's default ``batched_mm`` dispatch — same
-        accumulation order, same precision behaviour — so bf16 outputs align
-        with HF's reference run, which the prior per-expert Python loop did
-        not (accumulation order differed, adding ~0.5 max-abs drift).
+        Flattens (token, expert_slot) pairs into S = N*K, gathers weights per
+        pair, runs two ``torch.bmm`` calls, and reduces top-k via reshape+sum.
+        Same math as HF's ``batched_mm_experts_forward``. Used when:
+
+          * transformers v5 dispatches us as the "eager" fallback (e.g. CPU or
+            grouped_mm unavailable), or
+          * transformers v4 is installed (no dispatch decorator).
         """
         num_tokens, hidden_dim = hidden_states.shape
         num_top_k = top_k_index.size(-1)
         device = hidden_states.device
 
-        # Flatten (token, expert_slot) pairs into S
         token_idx = (
             torch.arange(num_tokens, device=device)
             .unsqueeze(1)
@@ -75,33 +104,35 @@ class _Experts(nn.Module):
         expert_ids = top_k_index.reshape(-1)               # (S,)
         sample_weights = top_k_weights.reshape(-1)         # (S,)
 
-        # Sentinel handling (no-op without expert parallelism, but matches HF)
         invalid_mask = expert_ids >= self.num_experts
         expert_ids = expert_ids.clamp(0, self.num_experts - 1)
 
-        # (S, H) — tokens repeated per expert_slot
         selected_hidden = hidden_states[token_idx]
 
-        # Up projection: (S, 2*I, H) @ (S, H, 1) -> (S, 2*I)
         sel_gate_up = self.gate_up_proj[expert_ids]
         proj = torch.bmm(sel_gate_up, selected_hidden.unsqueeze(-1)).squeeze(-1)
 
-        # Gate activation: SwiGLU
         gate, up = proj.chunk(2, dim=-1)
-        proj = self.act_fn(gate) * up                      # (S, I)
+        proj = self.act_fn(gate) * up
 
-        # Down projection: (S, H, I) @ (S, I, 1) -> (S, H)
         sel_down = self.down_proj[expert_ids]
         proj = torch.bmm(sel_down, proj.unsqueeze(-1)).squeeze(-1)
 
-        # Apply router weights and zero out any invalid-expert slots
-        weighted = proj * sample_weights.unsqueeze(-1)     # (S, H)
+        weighted = proj * sample_weights.unsqueeze(-1)
         if invalid_mask.any():
             weighted = weighted.masked_fill(invalid_mask.unsqueeze(-1), 0.0)
 
-        # Merge top-k per token via reshape+sum (order-stable, matches HF)
         out = weighted.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
         return out.to(hidden_states.dtype)
+
+
+if use_experts_implementation is not None:
+    # Attach HF's dispatch layer. Adds self.has_gate / has_bias / is_transposed
+    # (all matching our layout), self.config, and a forward shim that routes
+    # through ALL_EXPERTS_FUNCTIONS. The class object is the same afterwards —
+    # isinstance(module, _Experts) checks elsewhere (notably _init_weights)
+    # still match.
+    _Experts = use_experts_implementation(_Experts)
 
 
 class _TopKRouter(nn.Module):
