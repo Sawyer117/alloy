@@ -5,15 +5,28 @@ Two entry points for building an `AlloyForCausalLM` and running it end-to-end
 
 ## `build_from_config.py` — declarative
 
-Architecture lives in a JSON file (`configs/qwen3_4b.json` here). The script
-parses it into an `AlloyConfig`, builds the model, loads Qwen3-4B weights, and
-generates.
+Architecture lives in a JSON file. The script parses it into an `AlloyConfig`,
+builds the model, loads matching weights, and generates.
+
+Shipped configs:
+
+| Config file | Target ckpt | Architecture |
+|---|---|---|
+| `configs/qwen3_4b.json` | Qwen3-4B | 36 × `full_attention` + `mlp`, tied embeddings |
+| `configs/qwen3_5_35b_a3b.json` | Qwen3.5-35B-A3B | 40 layers, 3:1 `linear_attention` (GDN) to `full_attention`, MoE FFN throughout, attn output gate + unit-offset RMSNorm + partial rotary + mRoPE |
 
 ```bash
+# plain full-attention path:
 python -m alloy.examples.build_from_config \
+    --config alloy/examples/configs/qwen3_4b.json \
     --pretrained /path/to/Qwen3-4B \
-    --prompt "The theory of relativity is" \
     --dtype bf16 --max-new-tokens 32
+
+# GDN + MoE hybrid path:
+python -m alloy.examples.build_from_config \
+    --config alloy/examples/configs/qwen3_5_35b_a3b.json \
+    --pretrained /path/to/Qwen3.5-35B-A3B \
+    --dtype bf16 --max-new-tokens 8
 ```
 
 Use this path when:
@@ -21,11 +34,10 @@ Use this path when:
 - you want to share configs on HuggingFace Hub alongside checkpoints
 - multiple training runs differ only in config values
 
-To express a new hybrid, copy `configs/qwen3_4b.json`, replace
-`layer_types` / `ffn_types` with your mix (e.g. `"linear_attention"` every
-3 of 4 positions), point `--pretrained` at a compatible ckpt (or pass
-`--no-load-ckpt` to skip the load step and run on random weights for a
-plumbing check).
+To express a new hybrid, copy one of the shipped configs and edit
+`layer_types` / `ffn_types` (and the matching `linear_*` / `moe_*` / attention
+hyperparameter blocks). Pass `--no-load-ckpt` to skip weight loading and
+exercise the build + generate plumbing on random init.
 
 ## `build_from_python.py` — programmatic
 
