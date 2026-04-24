@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 
 from transformers.configuration_utils import PretrainedConfig
 
@@ -39,86 +38,38 @@ class AlloyConfig(PretrainedConfig):
     # --------------------------------------------------------------------- #
     _SECTION_MARKER_PREFIX = "_section_"
 
-    # Ordered (header, field_names) tuples. Anything not listed falls through
-    # into an "Other" group at the bottom, so adding a new config field never
-    # silently drops it from the JSON — it just lands in "Other" until the
-    # group table is updated.
-    _CONFIG_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
-        (
-            "Meta",
-            (
-                "model_type",
-                "architectures",
-                "torch_dtype",
-                "dtype",
-                "transformers_version",
-                "tie_word_embeddings",
-                "use_cache",
-                "pad_token_id",
-                "bos_token_id",
-                "eos_token_id",
-                "keys_to_ignore_at_inference",
-            ),
-        ),
-        (
-            "Global shape (cross-layer)",
-            (
-                "vocab_size",
-                "hidden_size",
-                "num_hidden_layers",
-                "max_position_embeddings",
-                "initializer_range",
-                "hidden_act",
-            ),
-        ),
-        (
-            "Architecture mix (one entry per layer)",
-            ("layer_types", "ffn_types"),
-        ),
-        (
-            "Norm (RMSNorm, shared)",
-            ("rms_norm_eps", "rms_norm_unit_offset"),
-        ),
-        (
-            "Rotary (RoPE, shared across attention layers)",
-            ("rope_parameters",),
-        ),
-        (
-            "Attention --- full_attention / sliding_attention (GQAAttention)",
-            (
-                "num_attention_heads",
-                "num_key_value_heads",
-                "head_dim",
-                "attention_bias",
-                "attention_dropout",
-                "attn_output_gate",
-                "sliding_window",
-            ),
-        ),
-        (
-            "Linear attention --- linear_attention (GatedDeltaNet)",
-            (
-                "linear_num_key_heads",
-                "linear_num_value_heads",
-                "linear_key_head_dim",
-                "linear_value_head_dim",
-                "linear_conv_kernel_dim",
-            ),
-        ),
-        (
-            "Dense FFN --- mlp (SwiGLUMLP)",
-            ("intermediate_size",),
-        ),
-        (
-            "Sparse MoE --- moe (SparseMoEBlock)",
-            (
-                "num_experts",
-                "num_experts_per_tok",
-                "moe_intermediate_size",
-                "shared_expert_intermediate_size",
-                "router_aux_loss_coef",
-            ),
-        ),
+    # Ordered (slug, header, field_names) tuples. Anything not listed falls
+    # through into an "other" group at the bottom, so adding a new config field
+    # never silently drops it from the JSON — it just lands in "other" until
+    # the group table is updated.
+    _CONFIG_GROUPS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+        ("meta", "Meta", (
+            "model_type", "architectures", "torch_dtype", "dtype", "transformers_version",
+            "tie_word_embeddings", "use_cache",
+            "pad_token_id", "bos_token_id", "eos_token_id", "keys_to_ignore_at_inference",
+        )),
+        ("shape", "Global shape", (
+            "vocab_size", "hidden_size", "num_hidden_layers",
+            "max_position_embeddings", "initializer_range", "hidden_act",
+        )),
+        ("arch", "Architecture mix", ("layer_types", "ffn_types")),
+        ("norm", "Norm", ("rms_norm_eps", "rms_norm_unit_offset")),
+        ("rotary", "Rotary", ("rope_parameters",)),
+        ("attention", "Attention", (
+            "num_attention_heads", "num_key_value_heads", "head_dim",
+            "attention_bias", "attention_dropout",
+            "attn_output_gate", "sliding_window",
+        )),
+        ("linear_attn", "Linear attention", (
+            "linear_num_key_heads", "linear_num_value_heads",
+            "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
+        )),
+        ("mlp", "MLP", ("intermediate_size",)),
+        ("moe", "MoE", (
+            "num_experts", "num_experts_per_tok",
+            "moe_intermediate_size", "shared_expert_intermediate_size",
+            "router_aux_loss_coef",
+        )),
     )
 
     def __init__(
@@ -243,10 +194,6 @@ class AlloyConfig(PretrainedConfig):
     # ------------------------------------------------------------------ #
     # Human-readable JSON serialization
     # ------------------------------------------------------------------ #
-    @classmethod
-    def _slug(cls, header: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", header.lower()).strip("_")
-
     def to_json_string(self, use_diff: bool = True) -> str:
         """Serialize to JSON with fields grouped by owning module.
 
@@ -259,19 +206,18 @@ class AlloyConfig(PretrainedConfig):
         base_dict = json.loads(super().to_json_string(use_diff=use_diff))
         ordered: dict = {}
         seen: set[str] = set()
-        for idx, (header, field_names) in enumerate(self._CONFIG_GROUPS):
+        for slug, header, field_names in self._CONFIG_GROUPS:
             group = [(name, base_dict[name]) for name in field_names if name in base_dict]
             if not group:
                 continue
-            marker_key = f"{self._SECTION_MARKER_PREFIX}{idx:02d}_{self._slug(header)}"
-            ordered[marker_key] = f"===== {header} ====="
+            ordered[f"{self._SECTION_MARKER_PREFIX}{slug}"] = f"===== {header} ====="
             for name, value in group:
                 ordered[name] = value
                 seen.add(name)
 
         leftover = [(k, v) for k, v in base_dict.items() if k not in seen]
         if leftover:
-            ordered[f"{self._SECTION_MARKER_PREFIX}99_other"] = "===== Other (ungrouped) ====="
+            ordered[f"{self._SECTION_MARKER_PREFIX}other"] = "===== Other ====="
             for k, v in leftover:
                 ordered[k] = v
 
