@@ -17,7 +17,7 @@ import gc
 import json
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 
@@ -66,10 +66,22 @@ def load_state_dict_from_disk(
     model_path: str | Path,
     ignore_patterns: Iterable[str] = (),
     device: str | torch.device = "cpu",
+    key_remap: Callable[[str], str | None] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Stream a full state_dict from safetensors shards, skipping ignored keys.
 
     Memory-maps shards so unused tensors aren't materialized in RAM all at once.
+
+    Parameters
+    ----------
+    key_remap : optional callable ``(old_key) -> new_key | None``
+        Applied to every non-ignored key before insertion. Returning ``None``
+        skips the key (same effect as matching an ``ignore_patterns`` entry).
+        Useful when the checkpoint layout (e.g. an HF
+        ``...ForConditionalGeneration`` wrapper that nests the text backbone
+        under ``model.language_model.*``) doesn't match the target model's
+        module tree. HF's own ``from_pretrained`` handles this via
+        ``base_model_prefix``; raw safetensors reads need it done by hand.
     """
     from safetensors.torch import load_file
 
@@ -96,6 +108,11 @@ def load_state_dict_from_disk(
         for k, v in shard_sd.items():
             if any(r.match(k) for r in ignore_re):
                 continue
+            if key_remap is not None:
+                new_k = key_remap(k)
+                if new_k is None:
+                    continue
+                k = new_k
             full_sd[k] = v
     return full_sd
 

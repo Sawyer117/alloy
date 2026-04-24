@@ -126,6 +126,18 @@ def phase_ours(
 
     ours = AlloyForCausalLM(alloy_cfg).to(dtype)
     print(f"[phase-2] streaming state_dict from {pretrained}")
+
+    # Qwen3_5MoeForConditionalGeneration stores text-backbone weights under
+    # model.language_model.*; Qwen3_5MoeForCausalLM (and our Alloy equivalent)
+    # expect them under model.*. HF's from_pretrained strips this via
+    # base_model_prefix; raw safetensors reads need it explicit.
+    _LM_PREFIX = "model.language_model."
+
+    def _strip_language_model_prefix(k: str) -> str:
+        if k.startswith(_LM_PREFIX):
+            return "model." + k[len(_LM_PREFIX):]
+        return k
+
     sd = load_state_dict_from_disk(
         pretrained,
         ignore_patterns=[
@@ -135,6 +147,7 @@ def phase_ours(
             r".*rotary_emb\.inv_freq$",
         ],
         device="cpu",
+        key_remap=_strip_language_model_prefix,
     )
     res = ours.load_state_dict(sd, strict=False)
     print(f"[phase-2] load_state_dict: missing={len(res.missing_keys)} unexpected={len(res.unexpected_keys)}")
