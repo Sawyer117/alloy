@@ -1,0 +1,96 @@
+# MindSpeed-LLM FSDP2 launch config for alloy_340m_dense (qwen3_next-style hybrid).
+#
+# Architecture: 24 layers, 3:1 GDN:full-attention, dense SwiGLU MLP, partial
+# RoPE 0.25, unit-offset RMSNorm. See alloy/examples/configs/qwen3_next_340m_dense.json
+# for the model definition.
+#
+# Pre-flight (consumer side):
+#   1) `pip install git+https://github.com/Sawyer117/alloy.git` (or editable install)
+#   2) Materialize the alloy model directory (config.json + modeling_alloy.py shim
+#      + tokenizer files) at `model.model_name_or_path`. Use:
+#         python -m alloy.examples.package_config_for_hub \
+#             --config alloy/examples/configs/qwen3_next_340m_dense.json \
+#             --target /path/to/my_alloy_340m
+#         # then copy your tokenizer.json / tokenizer_config.json /
+#         # special_tokens_map.json into /path/to/my_alloy_340m/
+#   3) Edit the two paths below (model.model_name_or_path, data.dataset.file_name).
+#
+# Launch via the sibling .sh script.
+
+model:
+  # DO NOT set model_id — that routes to MindSpeed's built-in models
+  # (qwen3_next / qwen3 / gpt_oss etc.) and would bypass our auto_map shim.
+  # Leaving it unset makes ModelLoader fall through to
+  # AutoModelForCausalLM.from_config(trust_remote_code=True), which resolves
+  # AlloyConfig / AlloyForCausalLM via config.json's auto_map field.
+  model_name_or_path: /path/to/my_alloy_340m   # <-- EDIT
+  trust_remote_code: True
+  train_from_scratch: True
+  init_model_with_meta_device: True
+
+data:
+  dataset:
+    file_name: /path/to/your/data.parquet      # <-- EDIT (parquet/json/jsonl/arrow all OK)
+  template: gpt           # PT stage barely uses templates; gpt is a safe pass-through
+  cutoff_len: 4096
+  max_samples: 1000000
+  overwrite_cache: True   # First run converts raw parquet -> Megatron bin/idx, cached
+                          # next to the source file. Make sure that dir is writable.
+  preprocessing_num_workers: 4
+  data_manager_type: mg   # PT stage requires Megatron data manager
+  packing: False
+
+parallel:
+  # 8 NPUs * 1 node = 8 ranks. fsdp_size = world_size for pure data-parallel sharding.
+  fsdp_size: 8
+  # alloy uses HF-canonical naming (model.embed_tokens, model.layers, lm_head),
+  # so these standard FSDP module patterns work without modification.
+  fsdp_modules:
+    - model.layers.{*}
+    - model.embed_tokens
+    - lm_head
+  tp_size: 1     # 340M is small enough to fit on one rank, no tensor parallelism
+  ep_size: 1     # dense model, no expert parallelism
+  cp_size: 1
+  recompute: True
+  recompute_modules:
+    - model.layers.{*}
+  reduce_dtype: bf16
+
+training:
+  stage: pt
+  per_device_train_batch_size: 6     # MBS from the original Megatron script
+  gradient_accumulation_steps: 1     # GBS=48 / (MBS=6 * world=8) = 1
+  dataloader_num_workers: 4
+  seed: 42
+  dataloader_drop_last: True
+  output_dir: ./output_alloy_340m
+
+  optimizer: adamw
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  max_grad_norm: 1.0
+
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.01     # = 1024 / 101726 from the original --lr-warmup-iters
+
+  num_train_epochs: 1
+  max_steps: 101726      # = --train-iters from the original script
+  save_steps: 29529      # = --save-interval
+  logging_steps: 1
+
+optimization:
+  # NOTE: use_triton_gdn / use_fused_rmsnorm are MindSpeed-LLM patches that
+  # register_patches() injects into the *built-in* qwen3_next classes. alloy
+  # routes through trust_remote_code so those patches don't reach our
+  # Qwen35GatedDeltaNet / RMSNorm — these flags are no-ops for alloy until
+  # alloy-npu lands. Leaving them on is harmless.
+  use_flash_attn: True
+  use_fused_rotary_pos_emb: True
+  use_fused_rmsnorm: True
+  use_triton_gdn: True
+  chunk_loss_size: 1024
