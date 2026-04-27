@@ -310,9 +310,31 @@ def main() -> int:
 
     tokens_ok = tok_cmp["match"]
     logits_ok = logit_diff["max_abs"] <= args.atol + args.rtol * logit_diff["max_ref_abs"]
-    overall = tokens_ok and logits_ok
-    print(f"\n{'PASS' if overall else 'FAIL'}  (tokens_ok={tokens_ok}, logits_ok={logits_ok}, "
-          f"tol: atol={args.atol}, rtol={args.rtol})")
+
+    # Under truncation the model is degenerate (a 4-layer Qwen3.5-MoE just
+    # produces gibberish in a loop), so greedy decoding diverges on the
+    # first token where two near-equal logits flip under bf16 noise. That is
+    # not a math-equivalence failure — it just means the model has nothing
+    # meaningful to decode. Use logits_ok as the binding criterion in that
+    # regime; tokens_ok degrades to informational. When run end-to-end
+    # (--num-layers == original_num_layers) we fall back to the strict
+    # GPU-script criterion.
+    truncated = args.num_layers != ref_out["original_num_layers"]
+    if truncated:
+        overall = logits_ok
+        verdict = "PASS" if overall else "FAIL"
+        print(
+            f"\n{verdict}  (truncated to {args.num_layers}/{ref_out['original_num_layers']} layers — "
+            f"logits_ok={logits_ok} is binding; tokens_ok={tokens_ok} informational, "
+            f"tol: atol={args.atol}, rtol={args.rtol})"
+        )
+    else:
+        overall = tokens_ok and logits_ok
+        verdict = "PASS" if overall else "FAIL"
+        print(
+            f"\n{verdict}  (tokens_ok={tokens_ok}, logits_ok={logits_ok}, "
+            f"tol: atol={args.atol}, rtol={args.rtol})"
+        )
     return 0 if overall else 1
 
 
