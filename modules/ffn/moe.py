@@ -41,7 +41,7 @@ class _SharedMLP(nn.Module):
 
 
 class _Experts(nn.Module):
-    """Grouped experts as 3D weight tensors — matches Qwen3_5MoeExperts layout.
+    """Grouped experts as 3D weight tensors — byte-identical to HF Qwen3_5MoeExperts.
 
     Weights:
       gate_up_proj : [num_experts, 2*intermediate, hidden]
@@ -54,9 +54,12 @@ class _Experts(nn.Module):
 
         * ``grouped_mm`` (default on modern GPU): torch._grouped_mm fused kernel
         * ``batched_mm``: bmm-based batched path, available on any GPU
-        * ``eager`` / unavailable backend: falls through to the forward defined
-          below, which is itself a batched-bmm implementation — so the "eager"
-          fallback is still fast on any device.
+        * ``eager`` / unavailable backend: falls through to the forward below.
+
+      The forward below is a byte-identical port of HF's ``Qwen3_5MoeExperts.forward``
+      (per-expert F.linear loop with ``index_add_``). On NPU — where grouped_mm
+      cannot dispatch and HF auto-falls-back to "eager" — both the HF reference and
+      alloy run this same per-expert loop, so fp32 is bit-exact.
 
       Custom backends (including a future NPU fused MoE) can be plugged in without
       modifying alloy:
@@ -81,49 +84,31 @@ class _Experts(nn.Module):
         top_k_index: torch.Tensor,    # [N, K]
         top_k_weights: torch.Tensor,  # [N, K]
     ) -> torch.Tensor:
-        """Eager-path batched forward.
+        """Eager-path: byte-identical port of HF Qwen3_5MoeExperts.forward.
 
-        Flattens (token, expert_slot) pairs into S = N*K, gathers weights per
-        pair, runs two ``torch.bmm`` calls, and reduces top-k via reshape+sum.
-        Same math as HF's ``batched_mm_experts_forward``. Used when:
-
-          * transformers v5 dispatches us as the "eager" fallback (e.g. CPU or
-            grouped_mm unavailable), or
-          * transformers v4 is installed (no dispatch decorator).
+        Iterates hit experts, applies each expert's F.linear to its routed tokens,
+        accumulates with index_add_. Op-for-op the same as HF's eager forward, so
+        fp32 outputs match HF bit-exactly when both fall back to "eager".
         """
-        num_tokens, hidden_dim = hidden_states.shape
-        num_top_k = top_k_index.size(-1)
-        device = hidden_states.device
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-        token_idx = (
-            torch.arange(num_tokens, device=device)
-            .unsqueeze(1)
-            .expand(-1, num_top_k)
-            .reshape(-1)
-        )                                                  # (S,)
-        expert_ids = top_k_index.reshape(-1)               # (S,)
-        sample_weights = top_k_weights.reshape(-1)         # (S,)
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = self.act_fn(gate) * up
+            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
-        invalid_mask = expert_ids >= self.num_experts
-        expert_ids = expert_ids.clamp(0, self.num_experts - 1)
-
-        selected_hidden = hidden_states[token_idx]
-
-        sel_gate_up = self.gate_up_proj[expert_ids]
-        proj = torch.bmm(sel_gate_up, selected_hidden.unsqueeze(-1)).squeeze(-1)
-
-        gate, up = proj.chunk(2, dim=-1)
-        proj = self.act_fn(gate) * up
-
-        sel_down = self.down_proj[expert_ids]
-        proj = torch.bmm(sel_down, proj.unsqueeze(-1)).squeeze(-1)
-
-        weighted = proj * sample_weights.unsqueeze(-1)
-        if invalid_mask.any():
-            weighted = weighted.masked_fill(invalid_mask.unsqueeze(-1), 0.0)
-
-        out = weighted.view(num_tokens, num_top_k, hidden_dim).sum(dim=1)
-        return out.to(hidden_states.dtype)
+        return final_hidden_states
 
 
 if use_experts_implementation is not None:
