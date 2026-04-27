@@ -218,6 +218,37 @@ class AlloyConfig(PretrainedConfig):
             raise ValueError("ffn_types contains 'qwen3_5_moe' but num_experts <= 0")
 
     # ------------------------------------------------------------------ #
+    # Validator override: bypass HF's `validate_layer_type` strict check
+    # ------------------------------------------------------------------ #
+    def validate(self) -> None:
+        """Run HF's PreTrainedConfig validators, but spoof ``layer_types`` past
+        ``validate_layer_type``.
+
+        HF's strict-dataclass on ``PreTrainedConfig`` ships a ``validate_layer_type``
+        validator that requires every entry in ``self.layer_types`` to belong to
+        a fixed canonical vocabulary (``full_attention``, ``sliding_attention``,
+        ``linear_attention``, …). alloy uses source-coupled keys
+        (``qwen3_attention``, ``qwen3_5_gdn``, …) that this validator rejects.
+
+        We can't selectively disable a single strict-dataclass validator from a
+        subclass, so we swap ``layer_types`` to a HF-canonical placeholder for
+        the duration of the validator pass and restore afterwards. Every *other*
+        validator HF contributes still runs against real values.
+
+        Triggered by ``save_pretrained`` (which calls ``self.validate()``);
+        ``__init__`` already avoids the issue by deferring the assignment of
+        ``self.layer_types`` until after ``super().__init__()``.
+        """
+        saved = list(self.layer_types) if self.layer_types is not None else None
+        try:
+            if saved is not None:
+                self.layer_types = ["full_attention"] * len(saved)
+            super().validate()
+        finally:
+            if saved is not None:
+                self.layer_types = saved
+
+    # ------------------------------------------------------------------ #
     # Human-readable JSON serialization
     # ------------------------------------------------------------------ #
     def to_json_string(self, use_diff: bool = True) -> str:
