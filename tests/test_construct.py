@@ -24,7 +24,7 @@ from alloy import AlloyConfig, AlloyForCausalLM
 
 
 def _qwen3_like_config() -> AlloyConfig:
-    """All layers = full_attention + mlp, no output gate, ones-init RMSNorm."""
+    """All layers = qwen3_attention + qwen3_mlp, no output gate, ones-init RMSNorm."""
     num_layers = 2
     return AlloyConfig(
         vocab_size=1024,
@@ -39,14 +39,14 @@ def _qwen3_like_config() -> AlloyConfig:
         rms_norm_eps=1e-6,
         rms_norm_unit_offset=False,
         attn_output_gate=False,
-        layer_types=["full_attention"] * num_layers,
-        ffn_types=["mlp"] * num_layers,
+        layer_types=["qwen3_attention"] * num_layers,
+        ffn_types=["qwen3_mlp"] * num_layers,
         rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
     )
 
 
 def _qwen3_5_moe_like_config() -> AlloyConfig:
-    """4 layers: [linear, linear, linear, full] × moe FFN, gated attn, (1+w)-init RMSNorm."""
+    """4 layers: [gdn, gdn, gdn, attn] × qwen3_5_moe FFN, gated attn, (1+w)-init RMSNorm."""
     num_layers = 4
     return AlloyConfig(
         vocab_size=1024,
@@ -61,8 +61,8 @@ def _qwen3_5_moe_like_config() -> AlloyConfig:
         rms_norm_eps=1e-6,
         rms_norm_unit_offset=True,
         attn_output_gate=True,
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
-        ffn_types=["moe"] * num_layers,
+        layer_types=["qwen3_5_gdn", "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_attention"],
+        ffn_types=["qwen3_5_moe"] * num_layers,
         linear_num_key_heads=2,
         linear_num_value_heads=4,
         linear_key_head_dim=32,

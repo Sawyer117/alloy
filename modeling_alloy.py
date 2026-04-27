@@ -12,9 +12,9 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_alloy import AlloyConfig
-from .modules.attention.gdn import GatedDeltaNet
-from .modules.ffn.mlp import SwiGLUMLP
-from .modules.ffn.moe import SparseMoEBlock, _Experts, _TopKRouter
+from .modules.attention.gdn import Qwen35GatedDeltaNet
+from .modules.ffn.mlp import Qwen3MLP  # noqa: F401  used for typing / external imports
+from .modules.ffn.moe import Qwen35SparseMoE, _Experts, _TopKRouter  # noqa: F401
 from .modules.registry import get_ffn, get_mixer
 from .modules.shared.norm import RMSNorm
 from .modules.shared.rotary import RotaryEmbedding
@@ -26,7 +26,7 @@ def _update_linear_attn_mask(
 ) -> torch.Tensor | None:
     """Match qwen3_5_moe's ``_update_linear_attn_mask``: return None when either
     the cache has prior state (no need to zero padding again) or the mask is all-ones.
-    Otherwise return the 2D mask unchanged for use inside GatedDeltaNet.
+    Otherwise return the 2D mask unchanged for use inside Qwen35GatedDeltaNet.
     """
     has_prev = False
     if past_key_values is not None:
@@ -150,7 +150,7 @@ class AlloyPreTrainedModel(PreTrainedModel):
                 nn.init.zeros_(module.weight)
             else:
                 nn.init.ones_(module.weight)
-        elif isinstance(module, GatedDeltaNet):
+        elif isinstance(module, Qwen35GatedDeltaNet):
             nn.init.ones_(module.dt_bias)
             with torch.no_grad():
                 module.A_log.copy_(torch.empty_like(module.A_log).uniform_(0, 16).log_())
@@ -177,8 +177,10 @@ class AlloyModel(AlloyPreTrainedModel):
         self.rotary_emb = RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        self.has_sliding_layers = "sliding_attention" in config.layer_types
-        self.has_linear_layers = "linear_attention" in config.layer_types
+        self._mask_kinds = tuple(get_mixer(name).mask_kind for name in config.layer_types)
+        self.has_causal_layers = "causal" in self._mask_kinds
+        self.has_sliding_layers = "sliding" in self._mask_kinds
+        self.has_linear_layers = "linear" in self._mask_kinds
 
         self.post_init()
 
@@ -214,11 +216,11 @@ class AlloyModel(AlloyPreTrainedModel):
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             ).unsqueeze(0)
 
-        # Build per-type masks once via HF utilities; layers index into this dict.
-        mask_for_type: dict[str, torch.Tensor | None] = {}
+        # Build one mask per mask_kind once via HF utilities; layers index by mask_kind.
+        mask_for_kind: dict[str, torch.Tensor | None] = {}
         if isinstance(attention_mask, dict):
             # Already prepared (e.g. by generate()); pass through.
-            mask_for_type = attention_mask
+            mask_for_kind = attention_mask
         else:
             mask_kwargs = {
                 "config": self.config,
@@ -227,18 +229,18 @@ class AlloyModel(AlloyPreTrainedModel):
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
             }
-            if "full_attention" in self.config.layer_types:
-                mask_for_type["full_attention"] = create_causal_mask(**mask_kwargs)
+            if self.has_causal_layers:
+                mask_for_kind["causal"] = create_causal_mask(**mask_kwargs)
             if self.has_sliding_layers:
-                mask_for_type["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+                mask_for_kind["sliding"] = create_sliding_window_causal_mask(**mask_kwargs)
             if self.has_linear_layers:
-                mask_for_type["linear_attention"] = _update_linear_attn_mask(attention_mask, past_key_values)
+                mask_for_kind["linear"] = _update_linear_attn_mask(attention_mask, past_key_values)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         for i, layer in enumerate(self.layers):
-            layer_mask = mask_for_type.get(self.config.layer_types[i])
+            layer_mask = mask_for_kind.get(self._mask_kinds[i])
             hidden_states = layer(
                 hidden_states,
                 attention_mask=layer_mask,

@@ -155,8 +155,8 @@ class _TopKRouter(nn.Module):
         return router_logits, router_top_value, router_indices
 
 
-@register_ffn("moe")
-class SparseMoEBlock(nn.Module):
+@register_ffn("qwen3_5_moe")
+class Qwen35SparseMoE(nn.Module):
     """Sparse MoE with top-K routing, grouped experts, and a gated shared expert.
 
     Port of Qwen3_5MoeSparseMoeBlock. Submodule names (``gate``, ``experts``,

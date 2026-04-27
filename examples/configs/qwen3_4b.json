@@ -11,21 +11,23 @@
   "hidden_act": "silu",
 
   "layer_types": [
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention",
-    "full_attention", "full_attention", "full_attention", "full_attention"
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention",
+    "qwen3_attention", "qwen3_attention", "qwen3_attention", "qwen3_attention"
   ],
   "ffn_types": [
-    "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp",
-    "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp",
-    "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp",
-    "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp", "mlp"
+    "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp",
+    "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp",
+    "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp",
+    "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp",
+    "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp",
+    "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp", "qwen3_mlp"
   ],
 
   "rms_norm_eps": 1e-06,

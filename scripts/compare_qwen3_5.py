@@ -20,6 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from alloy import AlloyConfig, AlloyForCausalLM
+from alloy.configuration_alloy import hf_layer_types_to_alloy
 
 
 def _tiny_qwen3_5_moe_text_config():
@@ -79,8 +80,8 @@ def _alloy_from_qwen3_5_config(q35_cfg) -> AlloyConfig:
         attention_dropout=q35_cfg.attention_dropout,
         attn_output_gate=True,               # q_proj = H*D*2 with sigmoid gate
         sliding_window=None,
-        layer_types=list(q35_cfg.layer_types),
-        ffn_types=["moe"] * num_layers,
+        layer_types=hf_layer_types_to_alloy(q35_cfg.layer_types),
+        ffn_types=["qwen3_5_moe"] * num_layers,
         # GDN
         linear_num_key_heads=q35_cfg.linear_num_key_heads,
         linear_num_value_heads=q35_cfg.linear_num_value_heads,

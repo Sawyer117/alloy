@@ -1,6 +1,8 @@
 # Alloy
 
-A HuggingFace-native library for composing hybrid transformer architectures layer by layer. Mix grouped-query attention, linear attention, gated DeltaNet, MoE, and more in arbitrary proportions — defined by a single `layer_types` list.
+A HuggingFace-native library for composing hybrid transformer architectures layer by layer. Mix grouped-query attention, gated DeltaNet, MoE, and more in arbitrary proportions — defined by a single `layer_types` list.
+
+Modules carry a source-coupled name (`qwen3_attention`, `qwen3_mlp`, `qwen3_5_moe`, `qwen3_5_gdn`, ...) so that variants ported from different upstream models — e.g. a `qwen3_mlp` (SwiGLU) and a future `bert_mlp` (GELU, no gate) — can coexist without colliding.
 
 ## Vision
 
@@ -30,7 +32,7 @@ class AlloyDecoderLayer(nn.Module):
 
 - `config.layer_types` is a `list[str]` of length `num_hidden_layers`, one string per layer naming the token mixer.
 - `config.ffn_types` is a `list[str]` of the same length, one string per layer naming the feed-forward block.
-- `MIXER_REGISTRY` and `FFN_REGISTRY` (defined in `alloy.modules.registry`) map those strings to `nn.Module` classes.
+- `MIXER_REGISTRY` and `FFN_REGISTRY` (defined in `alloy.modules.registry`) map those strings to `nn.Module` classes. Each mixer entry also declares a `mask_kind` (`"causal"`, `"sliding"`, or `"linear"`) that the model-level mask precompute uses to dispatch the right mask family — so adding a new mixer never requires editing `modeling_alloy.py`.
 - Sub-module attribute names (`self_attn`, `linear_attn`, `mlp`) match the conventions used by HuggingFace reference implementations, so checkpoint `state_dict` keys line up without rewriting.
 - Each mixer reads only the config fields it cares about; the config is a single flat bag of hyperparameters covering every registered module.
 
@@ -43,13 +45,13 @@ alloy/
 ├── configuration_alloy.py            # AlloyConfig(PretrainedConfig)
 ├── modeling_alloy.py                 # AlloyDecoderLayer, AlloyModel, AlloyForCausalLM
 ├── modules/
-│   ├── registry.py                   # MIXER_REGISTRY, FFN_REGISTRY, decorators
+│   ├── registry.py                   # MIXER_REGISTRY, FFN_REGISTRY, decorators (with mask_kind)
 │   ├── attention/
-│   │   ├── gqa.py                    # "full_attention", "sliding_attention"
-│   │   └── gdn.py                    # "linear_attention" (GatedDeltaNet)
+│   │   ├── gqa.py                    # "qwen3_attention", "qwen3_attention_sliding" (Qwen3Attention)
+│   │   └── gdn.py                    # "qwen3_5_gdn" (Qwen35GatedDeltaNet)
 │   ├── ffn/
-│   │   ├── mlp.py                    # "mlp" (SwiGLU)
-│   │   └── moe.py                    # "moe" (top-K router + grouped + shared experts)
+│   │   ├── mlp.py                    # "qwen3_mlp" (Qwen3MLP, SwiGLU)
+│   │   └── moe.py                    # "qwen3_5_moe" (Qwen35SparseMoE: top-K router + grouped + shared experts)
 │   └── shared/
 │       ├── norm.py                   # RMSNorm with unit_offset flag
 │       ├── rotary.py                 # RoPE with partial + interleaved-mRoPE support
@@ -93,9 +95,9 @@ config = AlloyConfig(
     head_dim=128,
     intermediate_size=8192,
     layer_types=[
-        "linear_attention", "linear_attention", "linear_attention", "full_attention",
+        "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_attention",
     ] * 4,
-    ffn_types=["mlp"] * 16,
+    ffn_types=["qwen3_mlp"] * 16,
 )
 model = AlloyForCausalLM(config)
 ```
@@ -103,7 +105,7 @@ model = AlloyForCausalLM(config)
 Swap the FFN for MoE by changing one field:
 
 ```python
-config.ffn_types = ["moe"] * 16
+config.ffn_types = ["qwen3_5_moe"] * 16
 config.num_experts = 128
 config.num_experts_per_tok = 8
 ```
@@ -115,7 +117,7 @@ Drop a file somewhere importable and decorate a module class:
 ```python
 from alloy.modules.registry import register_mixer
 
-@register_mixer("my_rwkv", attr_name="linear_attn")
+@register_mixer("my_rwkv", attr_name="linear_attn", mask_kind="linear")
 class MyRWKV(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -128,20 +130,22 @@ class MyRWKV(nn.Module):
 Then reference it by string in the config:
 
 ```python
-config = AlloyConfig(..., layer_types=["my_rwkv"] * 8 + ["full_attention"] * 8, ...)
+config = AlloyConfig(..., layer_types=["my_rwkv"] * 8 + ["qwen3_attention"] * 8, ...)
 ```
+
+`mask_kind` tells the model-level mask precompute which mask to hand this layer (`"causal"`, `"sliding"`, or `"linear"`) — pick whichever matches your forward's expectations. Naming convention: `<source_model>_<kind>` when the implementation is materially copied from a specific upstream model.
 
 Alloy's core never knew this mixer existed, and no PR to the library is required to use it.
 
 ## Built-in Modules
 
-| Registry key          | Class             | Notes                                                                            |
-|-----------------------|-------------------|----------------------------------------------------------------------------------|
-| `full_attention`      | `GQAAttention`    | Softmax GQA. `attn_output_gate=True` reproduces qwen3.5 gated output projection. |
-| `sliding_attention`   | `GQAAttention`    | Same class, `config.sliding_window` controls window mask at the model level.     |
-| `linear_attention`    | `GatedDeltaNet`   | Chunked + recurrent delta-rule kernels, torch fallback when `fla` unavailable.   |
-| `mlp`                 | `SwiGLUMLP`       | Standard SwiGLU MLP matching qwen3 / llama parameter names.                      |
-| `moe`                 | `SparseMoEBlock`  | Top-K router, grouped experts (3D weight tensors), gated shared expert.          |
+| Registry key                | Class                  | Source     | mask_kind | Notes                                                                            |
+|-----------------------------|------------------------|------------|-----------|----------------------------------------------------------------------------------|
+| `qwen3_attention`           | `Qwen3Attention`       | qwen3 / qwen3.5 | `causal`  | Softmax GQA. `attn_output_gate=True` reproduces qwen3.5 gated output projection. |
+| `qwen3_attention_sliding`   | `Qwen3Attention`       | qwen3 / qwen3.5 | `sliding` | Same class, `config.sliding_window` controls window mask at the model level.     |
+| `qwen3_5_gdn`               | `Qwen35GatedDeltaNet`  | qwen3.5    | `linear`  | Chunked + recurrent delta-rule kernels, torch fallback when `fla` unavailable.   |
+| `qwen3_mlp`                 | `Qwen3MLP`             | qwen3 / qwen3.5 | n/a       | SwiGLU MLP matching qwen3 / llama parameter names.                               |
+| `qwen3_5_moe`               | `Qwen35SparseMoE`      | qwen3.5    | n/a       | Top-K router, grouped experts (3D weight tensors), gated shared expert.          |
 
 Shared primitives used across mixers:
 
@@ -168,10 +172,12 @@ The same `AlloyForCausalLM(config)` runs on GPU (no patch, pure PyTorch) and NPU
 
 Parameter names match HuggingFace qwen3 / qwen3.5 exactly (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `q_norm`, `k_norm`, `gate_proj`, `up_proj`, `down_proj`, `conv1d`, `in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a`, `out_proj`, `A_log`, `dt_bias`, `norm`, `experts.gate_up_proj`, `experts.down_proj`, `shared_expert.*`, `shared_expert_gate`). HuggingFace Hub checkpoints load with a plain `load_state_dict(strict=False)` given the right config flags:
 
-| Target checkpoint       | Key config flags                                                                              |
-|-------------------------|-----------------------------------------------------------------------------------------------|
-| qwen3 family            | `attn_output_gate=False`, `rms_norm_unit_offset=False`, `ffn_types=["mlp"]*N`                 |
-| qwen3.5-MoE family      | `attn_output_gate=True`, `rms_norm_unit_offset=True`, `ffn_types=["moe"]*N`, partial + mRoPE  |
+| Target checkpoint       | Key config flags                                                                                       |
+|-------------------------|--------------------------------------------------------------------------------------------------------|
+| qwen3 family            | `attn_output_gate=False`, `rms_norm_unit_offset=False`, `ffn_types=["qwen3_mlp"]*N`                    |
+| qwen3.5-MoE family      | `attn_output_gate=True`, `rms_norm_unit_offset=True`, `ffn_types=["qwen3_5_moe"]*N`, partial + mRoPE  |
+
+HF `layer_types` strings (`"full_attention"`, `"sliding_attention"`, `"linear_attention"`) translate via `alloy.configuration_alloy.hf_layer_types_to_alloy` into alloy's vocabulary (`"qwen3_attention"`, `"qwen3_attention_sliding"`, `"qwen3_5_gdn"`).
 
 Helper functions `alloy_config_from_qwen3` and `alloy_config_from_qwen3_5_text` (in `alloy/tests/_compare_utils.py`) perform this translation automatically from a loaded HF config.
 
@@ -198,7 +204,7 @@ Under fp32 eager mode the small-scale random-init comparison against `Qwen3ForCa
 
 ## Known Limitations
 
-- **Incremental decoding for linear attention.** `GatedDeltaNet` expects a `HybridCache` exposing `update_conv_state` / `update_recurrent_state`. Generation with `DynamicCache` falls back to full re-forward per new token (`use_cache=False`). A proper hybrid-cache implementation is on the roadmap.
+- **Incremental decoding for linear attention.** `Qwen35GatedDeltaNet` expects a `HybridCache` exposing `update_conv_state` / `update_recurrent_state`. Generation with `DynamicCache` falls back to full re-forward per new token (`use_cache=False`). A proper hybrid-cache implementation is on the roadmap.
 - **NPU patch layer.** `alloy.npu_patch` is scoped and not yet implemented in this initial scaffolding.
 - **MoE routing micro-optimization.** The grouped-expert forward uses a Python `for` loop over hit experts. Correct and matches the HuggingFace reference, but not tuned for very large expert counts.
 
@@ -212,7 +218,7 @@ Under fp32 eager mode the small-scale random-init comparison against `Qwen3ForCa
 
 ## Acknowledgements
 
-The `GQAAttention`, `GatedDeltaNet`, and `SparseMoEBlock` implementations are ported from HuggingFace `transformers` (`modeling_qwen3.py`, `modeling_qwen3_5_moe.py`), preserving math and parameter names so upstream checkpoints load without modification. The registry-based decoder-layer pattern is inspired by HuggingFace's canonical hybrid decoder layout.
+The `Qwen3Attention`, `Qwen35GatedDeltaNet`, and `Qwen35SparseMoE` implementations are ported from HuggingFace `transformers` (`modeling_qwen3.py`, `modeling_qwen3_5_moe.py`), preserving math and parameter names so upstream checkpoints load without modification. The registry-based decoder-layer pattern is inspired by HuggingFace's canonical hybrid decoder layout.
 
 ## License
 

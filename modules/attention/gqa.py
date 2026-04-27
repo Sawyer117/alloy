@@ -7,14 +7,14 @@ from torch import nn
 
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ..registry import register_mixer
+from ..registry import get_mixer, register_mixer
 from ..shared.attention_kernels import eager_attention_forward
 from ..shared.norm import RMSNorm
 from ..shared.rotary import apply_rotary_pos_emb
 
 
-class GQAAttention(nn.Module):
-    """Grouped-Query Attention covering both qwen3 plain and qwen3.5 gated variants.
+class Qwen3Attention(nn.Module):
+    """Grouped-Query Attention ported from qwen3 / qwen3.5.
 
     - ``config.attn_output_gate=False``  => qwen3 style (no output gate, q_proj out = H*D)
     - ``config.attn_output_gate=True``   => qwen3.5 style (output gate, q_proj out = H*D*2)
@@ -27,7 +27,10 @@ class GQAAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.layer_type = config.layer_types[layer_idx] if config.layer_types else "full_attention"
+        # Look up our own registry entry to find out whether this layer is a
+        # sliding-window variant — without comparing string literals.
+        layer_name = config.layer_types[layer_idx] if config.layer_types else None
+        self.mask_kind = get_mixer(layer_name).mask_kind if layer_name else "causal"
 
         self.head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
         self.num_heads = config.num_attention_heads
@@ -49,9 +52,7 @@ class GQAAttention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset)
 
-        self.sliding_window = (
-            config.sliding_window if self.layer_type == "sliding_attention" else None
-        )
+        self.sliding_window = config.sliding_window if self.mask_kind == "sliding" else None
 
     def forward(
         self,
@@ -105,8 +106,8 @@ class GQAAttention(nn.Module):
         return attn_output, attn_weights
 
 
-# Register under both HF layer_type strings. For "sliding_attention" the same
-# class is used — sliding-window semantics are encoded in the mask produced at
-# the model level plus the `sliding_window` attribute consumed by kernels.
-register_mixer("full_attention", attr_name="self_attn")(GQAAttention)
-register_mixer("sliding_attention", attr_name="self_attn")(GQAAttention)
+# Register the same class under two alloy keys with different mask_kinds.
+# Sliding-window semantics are encoded by the mask the model precompute hands in
+# plus the `sliding_window` attribute consumed by attention kernels.
+register_mixer("qwen3_attention", attr_name="self_attn", mask_kind="causal")(Qwen3Attention)
+register_mixer("qwen3_attention_sliding", attr_name="self_attn", mask_kind="sliding")(Qwen3Attention)

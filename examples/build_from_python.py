@@ -40,6 +40,7 @@ from alloy import (
     load_state_dict_from_disk,
     strip_language_model_prefix,
 )
+from alloy.configuration_alloy import hf_layer_types_to_alloy
 
 
 # --------------------------------------------------------------------------- #
@@ -62,7 +63,8 @@ def build_alloy_config_from_qwen3_hf_dir(ckpt_dir: Path) -> AlloyConfig:
 
     num_layers = hf_cfg["num_hidden_layers"]
     head_dim = hf_cfg.get("head_dim") or hf_cfg["hidden_size"] // hf_cfg["num_attention_heads"]
-    layer_types = hf_cfg.get("layer_types") or ["full_attention"] * num_layers
+    hf_layer_types = hf_cfg.get("layer_types") or ["full_attention"] * num_layers
+    layer_types = hf_layer_types_to_alloy(hf_layer_types)
 
     return AlloyConfig(
         # Global shape
@@ -74,7 +76,7 @@ def build_alloy_config_from_qwen3_hf_dir(ckpt_dir: Path) -> AlloyConfig:
         tie_word_embeddings=hf_cfg.get("tie_word_embeddings", False),
         # Per-layer architecture
         layer_types=layer_types,
-        ffn_types=["mlp"] * num_layers,
+        ffn_types=["qwen3_mlp"] * num_layers,
         # Norm — Qwen3 uses plain RMSNorm (w * x, ones init)
         rms_norm_eps=hf_cfg["rms_norm_eps"],
         rms_norm_unit_offset=False,
@@ -111,9 +113,9 @@ def build_toy_hybrid_config() -> AlloyConfig:
         head_dim=64,
         intermediate_size=2048,
         max_position_embeddings=4096,
-        # 3 linear-attention layers per 1 full-attention layer, MoE FFN throughout.
-        layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"] * 2,
-        ffn_types=["moe"] * num_layers,
+        # 3 GDN layers per 1 full-attention layer, MoE FFN throughout.
+        layer_types=["qwen3_5_gdn", "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_attention"] * 2,
+        ffn_types=["qwen3_5_moe"] * num_layers,
         rms_norm_unit_offset=True,
         attn_output_gate=True,
         linear_num_key_heads=4,

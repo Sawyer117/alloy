@@ -1,35 +1,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Literal
 
 import torch.nn as nn
+
+
+MaskKind = Literal["causal", "sliding", "linear"]
 
 
 @dataclass(frozen=True)
 class MixerEntry:
     cls: type[nn.Module]
     attr_name: str  # name under which the module is stored on the DecoderLayer (matches HF state_dict)
+    mask_kind: MaskKind = "causal"
 
 
 MIXER_REGISTRY: dict[str, MixerEntry] = {}
 FFN_REGISTRY: dict[str, type[nn.Module]] = {}
 
 
-def register_mixer(name: str, attr_name: str) -> Callable[[type[nn.Module]], type[nn.Module]]:
+def register_mixer(
+    name: str,
+    attr_name: str,
+    mask_kind: MaskKind = "causal",
+) -> Callable[[type[nn.Module]], type[nn.Module]]:
     """
     Register a token-mixer (attention-like) module under a string key.
 
     `attr_name` determines the attribute on the DecoderLayer where the module is stored.
     For HF state_dict compatibility use:
-      - "self_attn"   for full_attention / sliding_attention / gated GQA
-      - "linear_attn" for linear_attention (e.g. GatedDeltaNet)
+      - "self_attn"   for full / sliding / gated GQA
+      - "linear_attn" for linear-attention (e.g. Qwen35GatedDeltaNet)
+
+    `mask_kind` declares which mask family this mixer needs at the model level:
+      - "causal"  : standard causal mask
+      - "sliding" : causal mask with a sliding window
+      - "linear"  : 2D padding mask consumed inside the recurrent kernel
     """
 
     def _wrap(cls: type[nn.Module]) -> type[nn.Module]:
         if name in MIXER_REGISTRY:
             raise ValueError(f"Mixer '{name}' already registered")
-        MIXER_REGISTRY[name] = MixerEntry(cls=cls, attr_name=attr_name)
+        MIXER_REGISTRY[name] = MixerEntry(cls=cls, attr_name=attr_name, mask_kind=mask_kind)
         return cls
 
     return _wrap

@@ -12,8 +12,8 @@ Shipped configs:
 
 | Config file | Target ckpt | Architecture |
 |---|---|---|
-| `configs/qwen3_4b.json` | Qwen3-4B | 36 × `full_attention` + `mlp`, tied embeddings |
-| `configs/qwen3_5_35b_a3b.json` | Qwen3.5-35B-A3B | 40 layers, 3:1 `linear_attention` (GDN) to `full_attention`, MoE FFN throughout, attn output gate + unit-offset RMSNorm + partial rotary + mRoPE |
+| `configs/qwen3_4b.json` | Qwen3-4B | 36 × `qwen3_attention` + `qwen3_mlp`, tied embeddings |
+| `configs/qwen3_5_35b_a3b.json` | Qwen3.5-35B-A3B | 40 layers, 3:1 `qwen3_5_gdn` to `qwen3_attention`, `qwen3_5_moe` FFN throughout, attn output gate + unit-offset RMSNorm + partial rotary + mRoPE |
 
 ```bash
 # plain full-attention path:

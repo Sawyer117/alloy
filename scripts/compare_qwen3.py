@@ -23,6 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from alloy import AlloyConfig, AlloyForCausalLM
+from alloy.configuration_alloy import hf_layer_types_to_alloy
 
 
 def _tiny_qwen3_config():
@@ -65,8 +66,8 @@ def _alloy_from_qwen3_config(qwen3_cfg) -> AlloyConfig:
         attention_dropout=qwen3_cfg.attention_dropout,
         attn_output_gate=False,
         sliding_window=getattr(qwen3_cfg, "sliding_window", None),
-        layer_types=list(qwen3_cfg.layer_types),
-        ffn_types=["mlp"] * num_layers,
+        layer_types=hf_layer_types_to_alloy(qwen3_cfg.layer_types),
+        ffn_types=["qwen3_mlp"] * num_layers,
         rope_parameters=dict(qwen3_cfg.rope_parameters),
         tie_word_embeddings=qwen3_cfg.tie_word_embeddings,
     )

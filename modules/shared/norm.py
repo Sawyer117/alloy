@@ -41,7 +41,7 @@ class RMSNorm(nn.Module):
 
 
 class RMSNormGated(nn.Module):
-    """Gated RMSNorm used by GatedDeltaNet (port of Qwen3_5MoeRMSNormGated).
+    """Gated RMSNorm used by Qwen35GatedDeltaNet (port of Qwen3_5MoeRMSNormGated).
 
     Normalizes `hidden_states` then multiplies by SiLU(gate).
     """

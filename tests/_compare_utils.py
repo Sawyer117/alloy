@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from ..configuration_alloy import AlloyConfig
+from ..configuration_alloy import AlloyConfig, hf_layer_types_to_alloy
 from ..loading import (  # noqa: F401  re-exported for back-compat
     build_on_device,
     build_skeleton,
@@ -46,9 +46,10 @@ def pick_device(prefer: str | None = None) -> torch.device:
 
 
 def alloy_config_from_qwen3(qwen3_cfg) -> AlloyConfig:
-    """qwen3-style checkpoint -> AlloyConfig (no output gate, ones-init RMSNorm, mlp FFN)."""
+    """qwen3-style checkpoint -> AlloyConfig (no output gate, ones-init RMSNorm, qwen3_mlp FFN)."""
     num_layers = qwen3_cfg.num_hidden_layers
-    layer_types = list(getattr(qwen3_cfg, "layer_types", None) or ["full_attention"] * num_layers)
+    hf_layer_types = list(getattr(qwen3_cfg, "layer_types", None) or ["full_attention"] * num_layers)
+    layer_types = hf_layer_types_to_alloy(hf_layer_types)
     return AlloyConfig(
         vocab_size=qwen3_cfg.vocab_size,
         hidden_size=qwen3_cfg.hidden_size,
@@ -67,16 +68,16 @@ def alloy_config_from_qwen3(qwen3_cfg) -> AlloyConfig:
         attn_output_gate=False,
         sliding_window=getattr(qwen3_cfg, "sliding_window", None),
         layer_types=layer_types,
-        ffn_types=["mlp"] * num_layers,
+        ffn_types=["qwen3_mlp"] * num_layers,
         rope_parameters=dict(qwen3_cfg.rope_parameters),
         tie_word_embeddings=qwen3_cfg.tie_word_embeddings,
     )
 
 
 def alloy_config_from_qwen3_5_text(q35_text_cfg) -> AlloyConfig:
-    """qwen3.5-style text config -> AlloyConfig (gated attn, (1+w)-init RMSNorm, moe FFN)."""
+    """qwen3.5-style text config -> AlloyConfig (gated attn, (1+w)-init RMSNorm, qwen3_5_moe FFN)."""
     num_layers = q35_text_cfg.num_hidden_layers
-    layer_types = list(q35_text_cfg.layer_types)
+    layer_types = hf_layer_types_to_alloy(list(q35_text_cfg.layer_types))
 
     rope = dict(q35_text_cfg.rope_parameters)
     rope.setdefault("partial_rotary_factor", 0.25)
@@ -103,7 +104,7 @@ def alloy_config_from_qwen3_5_text(q35_text_cfg) -> AlloyConfig:
         attn_output_gate=True,
         sliding_window=None,
         layer_types=layer_types,
-        ffn_types=["moe"] * num_layers,
+        ffn_types=["qwen3_5_moe"] * num_layers,
         linear_num_key_heads=q35_text_cfg.linear_num_key_heads,
         linear_num_value_heads=q35_text_cfg.linear_num_value_heads,
         linear_key_head_dim=q35_text_cfg.linear_key_head_dim,

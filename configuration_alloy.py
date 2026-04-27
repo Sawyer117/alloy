@@ -5,6 +5,22 @@ import json
 from transformers.configuration_utils import PretrainedConfig
 
 
+# Translation table from HuggingFace's canonical `layer_types` vocabulary
+# (used inside qwen3 / qwen3.5 modeling code) to alloy's source-coupled
+# registry keys. Lives here so both tests and examples can import it without
+# reaching into private modules.
+HF_LAYER_TYPE_TO_ALLOY: dict[str, str] = {
+    "full_attention": "qwen3_attention",
+    "sliding_attention": "qwen3_attention_sliding",
+    "linear_attention": "qwen3_5_gdn",
+}
+
+
+def hf_layer_types_to_alloy(hf_layer_types) -> list[str]:
+    """Translate an HF ``layer_types`` list into alloy's registry keys."""
+    return [HF_LAYER_TYPE_TO_ALLOY.get(t, t) for t in hf_layer_types]
+
+
 class AlloyConfig(PretrainedConfig):
     """Config for an Alloy transformer (mixed / hybrid token-mixer architectures).
 
@@ -12,8 +28,8 @@ class AlloyConfig(PretrainedConfig):
       - ``layer_types[i]`` picks the token mixer at layer i (must match a registered mixer)
       - ``ffn_types[i]``   picks the feed-forward at layer i (must match a registered FFN)
 
-    By default both are filled with their canonical defaults (``full_attention`` and ``mlp``)
-    if omitted. Length must equal ``num_hidden_layers``.
+    By default both are filled with their canonical defaults (``qwen3_attention`` and
+    ``qwen3_mlp``) if omitted. Length must equal ``num_hidden_layers``.
 
     The config carries every hyperparameter needed by every registered module; each module
     only reads the fields it cares about. This matches HF's convention (one PretrainedConfig
@@ -59,20 +75,20 @@ class AlloyConfig(PretrainedConfig):
         ("rms_norm_eps", "rms_norm_unit_offset"),
         # rotary
         ("rope_parameters",),
-        # attention (GQAAttention: full_attention / sliding_attention)
+        # attention (Qwen3Attention: qwen3_attention / qwen3_attention_sliding)
         (
             "num_attention_heads", "num_key_value_heads", "head_dim",
             "attention_bias", "attention_dropout",
             "attn_output_gate", "sliding_window",
         ),
-        # linear attention (GatedDeltaNet)
+        # linear attention (Qwen35GatedDeltaNet -> qwen3_5_gdn)
         (
             "linear_num_key_heads", "linear_num_value_heads",
             "linear_key_head_dim", "linear_value_head_dim", "linear_conv_kernel_dim",
         ),
-        # MLP
+        # MLP (qwen3_mlp)
         ("intermediate_size",),
-        # MoE
+        # MoE (qwen3_5_moe)
         (
             "num_experts", "num_experts_per_tok",
             "moe_intermediate_size", "shared_expert_intermediate_size",
@@ -162,9 +178,9 @@ class AlloyConfig(PretrainedConfig):
         self.rope_parameters = rope_parameters
 
         if layer_types is None:
-            layer_types = ["full_attention"] * num_hidden_layers
+            layer_types = ["qwen3_attention"] * num_hidden_layers
         if ffn_types is None:
-            ffn_types = ["mlp"] * num_hidden_layers
+            ffn_types = ["qwen3_mlp"] * num_hidden_layers
 
         if len(layer_types) != num_hidden_layers:
             raise ValueError(
@@ -175,18 +191,18 @@ class AlloyConfig(PretrainedConfig):
                 f"len(ffn_types)={len(ffn_types)} must equal num_hidden_layers={num_hidden_layers}"
             )
 
-        self.layer_types = list(layer_types)
-        self.ffn_types = list(ffn_types)
-
-        # Cross-field validation
+        # Cross-field validation that doesn't need layer_types / ffn_types
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
                 f"num_attention_heads ({self.num_attention_heads}) must be divisible by "
                 f"num_key_value_heads ({self.num_key_value_heads})"
             )
-        if "moe" in self.ffn_types and self.num_experts <= 0:
-            raise ValueError("ffn_types contains 'moe' but num_experts <= 0")
 
+        # PretrainedConfig runs a strict-dataclass validator on `layer_types`
+        # against HF's canonical vocabulary (full_attention / sliding_attention /
+        # ...). Alloy uses source-coupled keys (qwen3_attention / qwen3_5_gdn /
+        # ...) that the HF validator rejects. We therefore defer the assignment
+        # of `layer_types` / `ffn_types` until *after* the super init runs.
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -194,6 +210,12 @@ class AlloyConfig(PretrainedConfig):
             tie_word_embeddings=tie_word_embeddings,
             **kwargs,
         )
+
+        self.layer_types = list(layer_types)
+        self.ffn_types = list(ffn_types)
+
+        if "qwen3_5_moe" in self.ffn_types and self.num_experts <= 0:
+            raise ValueError("ffn_types contains 'qwen3_5_moe' but num_experts <= 0")
 
     # ------------------------------------------------------------------ #
     # Human-readable JSON serialization
@@ -243,4 +265,4 @@ class AlloyConfig(PretrainedConfig):
         return "\n".join(out_lines) + "\n"
 
 
-__all__ = ["AlloyConfig"]
+__all__ = ["AlloyConfig", "HF_LAYER_TYPE_TO_ALLOY", "hf_layer_types_to_alloy"]

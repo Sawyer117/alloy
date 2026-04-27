@@ -9,7 +9,7 @@ Qwen3.5-MoE text-only path:
     MTP heads cleanly.
   * Ours:      AlloyForCausalLM built with attn_output_gate=True,
                rms_norm_unit_offset=True, partial_rotary_factor=0.25,
-               mrope_interleaved=True, ffn_types=["moe"]*N.
+               mrope_interleaved=True, ffn_types=["qwen3_5_moe"]*N.
 
 Caveats for this path:
 

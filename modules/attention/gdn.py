@@ -171,8 +171,8 @@ def _torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
-@register_mixer("linear_attention", attr_name="linear_attn")
-class GatedDeltaNet(nn.Module):
+@register_mixer("qwen3_5_gdn", attr_name="linear_attn", mask_kind="linear")
+class Qwen35GatedDeltaNet(nn.Module):
     """Port of Qwen3_5MoeGatedDeltaNet.
 
     Parameter names match the HF qwen3.5_moe checkpoint exactly:

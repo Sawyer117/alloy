@@ -8,9 +8,9 @@ from transformers.activations import ACT2FN
 from ..registry import register_ffn
 
 
-@register_ffn("mlp")
-class SwiGLUMLP(nn.Module):
-    """SwiGLU feed-forward block matching qwen3 / qwen3.5 MLP.
+@register_ffn("qwen3_mlp")
+class Qwen3MLP(nn.Module):
+    """SwiGLU feed-forward block ported from qwen3 / qwen3.5.
 
     Parameter names (gate_proj / up_proj / down_proj) match HF checkpoints.
     The intermediate size is read from ``config.intermediate_size``.
