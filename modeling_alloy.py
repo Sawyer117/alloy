@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional, Union
+import inspect
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,26 @@ from .modules.ffn.moe import Qwen35SparseMoE, _Experts, _TopKRouter  # noqa: F40
 from .modules.registry import get_ffn, get_mixer
 from .modules.shared.norm import RMSNorm
 from .modules.shared.rotary import RotaryEmbedding
+
+
+def _accepted_param_names(fn: Callable) -> frozenset[str]:
+    """Return the set of explicit parameter names accepted by ``fn``.
+
+    Used to call HF's ``create_causal_mask`` / ``create_sliding_window_causal_mask``
+    portably across transformers versions: older releases take ``inputs_embeds``
+    + ``past_key_values``, newer ones drop those in favour of ``cache_position``
+    + per-batch shape kwargs. We pass a superset and filter at call time.
+    """
+    return frozenset(inspect.signature(fn).parameters)
+
+
+_CAUSAL_MASK_ACCEPTED = _accepted_param_names(create_causal_mask)
+_SLIDING_MASK_ACCEPTED = _accepted_param_names(create_sliding_window_causal_mask)
+
+
+def _call_mask_builder(fn: Callable, accepted: frozenset[str], **kwargs):
+    """Call an HF mask builder with only the kwargs its installed version accepts."""
+    return fn(**{k: v for k, v in kwargs.items() if k in accepted})
 
 
 def _update_linear_attn_mask(
@@ -222,17 +243,36 @@ class AlloyModel(AlloyPreTrainedModel):
             # Already prepared (e.g. by generate()); pass through.
             mask_for_kind = attention_mask
         else:
+            # HF's mask builders changed signature across transformers versions
+            # (older take inputs_embeds + past_key_values; newer prefer
+            # cache_position + per-batch shape kwargs). We assemble a superset
+            # and let _call_mask_builder filter to whatever the installed
+            # version actually accepts.
+            cache_position = torch.arange(
+                past_seen_tokens,
+                past_seen_tokens + inputs_embeds.shape[1],
+                device=inputs_embeds.device,
+            )
             mask_kwargs = {
                 "config": self.config,
                 "inputs_embeds": inputs_embeds,
+                "input_embeds": inputs_embeds,  # alt spelling used by some versions
                 "attention_mask": attention_mask,
                 "past_key_values": past_key_values,
                 "position_ids": position_ids,
+                "cache_position": cache_position,
+                "batch_size": inputs_embeds.shape[0],
+                "kv_length": past_seen_tokens + inputs_embeds.shape[1],
+                "kv_offset": past_seen_tokens,
             }
             if self.has_causal_layers:
-                mask_for_kind["causal"] = create_causal_mask(**mask_kwargs)
+                mask_for_kind["causal"] = _call_mask_builder(
+                    create_causal_mask, _CAUSAL_MASK_ACCEPTED, **mask_kwargs
+                )
             if self.has_sliding_layers:
-                mask_for_kind["sliding"] = create_sliding_window_causal_mask(**mask_kwargs)
+                mask_for_kind["sliding"] = _call_mask_builder(
+                    create_sliding_window_causal_mask, _SLIDING_MASK_ACCEPTED, **mask_kwargs
+                )
             if self.has_linear_layers:
                 mask_for_kind["linear"] = _update_linear_attn_mask(attention_mask, past_key_values)
 
