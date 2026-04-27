@@ -13,9 +13,9 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_alloy import AlloyConfig
-from .modules.attention.gdn import Qwen35GatedDeltaNet
-from .modules.ffn.mlp import Qwen3MLP  # noqa: F401  used for typing / external imports
-from .modules.ffn.moe import Qwen35SparseMoE, _Experts, _TopKRouter  # noqa: F401
+from .modules.attention.qwen3_5_gdn import Qwen35GatedDeltaNet
+from .modules.ffn.qwen3_mlp import Qwen3MLP  # noqa: F401  used for typing / external imports
+from .modules.ffn.qwen3_5_moe import Qwen35SparseMoE, _Experts, _TopKRouter  # noqa: F401
 from .modules.registry import get_ffn, get_mixer
 from .modules.shared.norm import RMSNorm
 from .modules.shared.rotary import RotaryEmbedding
@@ -159,7 +159,7 @@ class AlloyPreTrainedModel(PreTrainedModel):
         HF's stock heuristic in ``PreTrainedModel._can_set_experts_implementation``
         opens the modeling file of ``cls`` and grep's for the literal string
         ``"@use_experts_implementation"``. alloy applies that decorator on
-        ``_Experts`` inside ``alloy/modules/ffn/moe.py``, not in this file, so
+        ``_Experts`` inside ``alloy/modules/ffn/qwen3_5_moe.py``, not in this file, so
         the heuristic returns False and HF then forces ``_experts_implementation``
         from the default ``"grouped_mm"`` down to ``"eager"`` for us — while the
         upstream HF reference (whose modeling file *does* contain that decorator

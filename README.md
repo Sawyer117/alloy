@@ -62,11 +62,11 @@ alloy/
 ├── modules/
 │   ├── registry.py                   # MIXER_REGISTRY, FFN_REGISTRY, decorators (with mask_kind)
 │   ├── attention/
-│   │   ├── gqa.py                    # "qwen3_attention", "qwen3_attention_sliding"  → Qwen3Attention
-│   │   └── gdn.py                    # "qwen3_5_gdn"                                 → Qwen35GatedDeltaNet
+│   │   ├── qwen3_attention.py        # "qwen3_attention", "qwen3_attention_sliding"  → Qwen3Attention
+│   │   └── qwen3_5_gdn.py             # "qwen3_5_gdn"                                 → Qwen35GatedDeltaNet
 │   ├── ffn/
-│   │   ├── mlp.py                    # "qwen3_mlp"                                   → Qwen3MLP (SwiGLU)
-│   │   └── moe.py                    # "qwen3_5_moe"                                 → Qwen35SparseMoE
+│   │   ├── qwen3_mlp.py               # "qwen3_mlp"                                   → Qwen3MLP (SwiGLU)
+│   │   └── qwen3_5_moe.py             # "qwen3_5_moe"                                 → Qwen35SparseMoE
 │   └── shared/
 │       ├── norm.py                   # RMSNorm with unit_offset flag
 │       ├── rotary.py                 # RoPE with partial + interleaved-mRoPE support
