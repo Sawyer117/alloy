@@ -217,6 +217,16 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+    def _alloy_init_weights(self, init_std: float) -> None:
+        # The class's own *direct* Parameters only — child nn.Linear / nn.Conv1d
+        # / RMSNormGated layers are initialised by the parent traversal hitting
+        # them separately. dt_bias and A_log are bare Parameters so they need
+        # explicit handling here.
+        del init_std
+        nn.init.ones_(self.dt_bias)
+        with torch.no_grad():
+            self.A_log.copy_(torch.empty_like(self.A_log).uniform_(0, 16).log_())
+
     def forward(
         self,
         hidden_states: torch.Tensor,

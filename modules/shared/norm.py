@@ -36,6 +36,15 @@ class RMSNorm(nn.Module):
             # qwen3 / llama style: cast x back then multiply by w (w retains its dtype).
             return self.weight * x_normed.to(input_dtype)
 
+    def _alloy_init_weights(self, init_std: float) -> None:
+        # init_std is part of the alloy convention but unused here — RMSNorm
+        # initialises identity-equivalent: zeros for (1+w) style, ones for w style.
+        del init_std
+        if self.unit_offset:
+            nn.init.zeros_(self.weight)
+        else:
+            nn.init.ones_(self.weight)
+
     def extra_repr(self) -> str:
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}, unit_offset={self.unit_offset}"
 
@@ -59,3 +68,7 @@ class RMSNormGated(nn.Module):
         hidden_states = self.weight * hidden_states.to(input_dtype)
         hidden_states = hidden_states * F.silu(gate.to(torch.float32))
         return hidden_states.to(input_dtype)
+
+    def _alloy_init_weights(self, init_std: float) -> None:
+        del init_std
+        nn.init.ones_(self.weight)

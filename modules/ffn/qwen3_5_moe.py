@@ -110,13 +110,17 @@ class _Experts(nn.Module):
 
         return final_hidden_states
 
+    def _alloy_init_weights(self, init_std: float) -> None:
+        # gate_up_proj and down_proj are bare 3D Parameters (not nn.Linear);
+        # they aren't covered by the parent traversal's stdlib branches.
+        nn.init.normal_(self.gate_up_proj, mean=0.0, std=init_std)
+        nn.init.normal_(self.down_proj, mean=0.0, std=init_std)
+
 
 if use_experts_implementation is not None:
     # Attach HF's dispatch layer. Adds self.has_gate / has_bias / is_transposed
     # (all matching our layout), self.config, and a forward shim that routes
-    # through ALL_EXPERTS_FUNCTIONS. The class object is the same afterwards —
-    # isinstance(module, _Experts) checks elsewhere (notably _init_weights)
-    # still match.
+    # through ALL_EXPERTS_FUNCTIONS. The class object is the same afterwards.
     _Experts = use_experts_implementation(_Experts)
 
 
@@ -138,6 +142,10 @@ class _TopKRouter(nn.Module):
         router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
         router_top_value = router_top_value.to(router_logits.dtype)
         return router_logits, router_top_value, router_indices
+
+    def _alloy_init_weights(self, init_std: float) -> None:
+        # weight is a bare 2D Parameter, not nn.Linear's — own init.
+        nn.init.normal_(self.weight, mean=0.0, std=init_std)
 
 
 @register_ffn("qwen3_5_moe")

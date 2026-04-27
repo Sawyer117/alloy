@@ -13,12 +13,14 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_alloy import AlloyConfig
-from .modules.attention.qwen3_5_gdn import Qwen35GatedDeltaNet
-from .modules.ffn.qwen3_mlp import Qwen3MLP  # noqa: F401  used for typing / external imports
-from .modules.ffn.qwen3_5_moe import Qwen35SparseMoE, _Experts, _TopKRouter  # noqa: F401
 from .modules.registry import get_ffn, get_mixer
-from .modules.shared.norm import RMSNorm
 from .modules.shared.rotary import RotaryEmbedding
+# RMSNorm is the only non-stdlib module modeling_alloy *constructs directly*
+# (input_layernorm / post_attention_layernorm / final norm). All registered
+# mixer / FFN classes are looked up by string via get_mixer / get_ffn at
+# AlloyDecoderLayer construction time and ship their own ``init_weights`` —
+# this file never knows their names.
+from .modules.shared.norm import RMSNorm
 
 
 def _accepted_param_names(fn: Callable) -> frozenset[str]:
@@ -175,7 +177,36 @@ class AlloyPreTrainedModel(PreTrainedModel):
         return True
 
     def _init_weights(self, module: nn.Module) -> None:
+        """Initialise ``module``'s direct Parameters.
+
+        Dispatch order:
+
+        1. **Per-class ``_alloy_init_weights(self, init_std)`` hook**, if
+           defined on the module. This is the extension point — any
+           registered mixer / FFN / shared-primitive class ships its own
+           init logic here, so adding a new module type never requires
+           editing ``modeling_alloy.py``. The ``_alloy_`` prefix avoids
+           colliding with HF's ``PreTrainedModel.init_weights()`` (the
+           recursive driver, takes only ``self``).
+
+        2. **PyTorch stdlib types** (``nn.Linear`` / ``nn.Embedding`` /
+           ``nn.Conv1d``): initialised in alloy's standard form using
+           ``config.initializer_range``. We can't put a hook on these (we
+           don't own their classes) so they live here as a fallback.
+
+        Note that this method is called recursively by HF's
+        ``PreTrainedModel.init_weights`` for every module in the tree, so
+        each per-class hook only needs to handle *its own* direct
+        Parameters — bare ``nn.Parameter`` attributes that aren't part of
+        a child ``nn.Module``. Children are visited separately.
+        """
         std = self.config.initializer_range
+
+        init_hook = getattr(module, "_alloy_init_weights", None)
+        if callable(init_hook):
+            init_hook(std)
+            return
+
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
@@ -188,20 +219,6 @@ class AlloyPreTrainedModel(PreTrainedModel):
             nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, RMSNorm):
-            if module.unit_offset:
-                nn.init.zeros_(module.weight)
-            else:
-                nn.init.ones_(module.weight)
-        elif isinstance(module, Qwen35GatedDeltaNet):
-            nn.init.ones_(module.dt_bias)
-            with torch.no_grad():
-                module.A_log.copy_(torch.empty_like(module.A_log).uniform_(0, 16).log_())
-        elif isinstance(module, _Experts):
-            nn.init.normal_(module.gate_up_proj, mean=0.0, std=std)
-            nn.init.normal_(module.down_proj, mean=0.0, std=std)
-        elif isinstance(module, _TopKRouter):
-            nn.init.normal_(module.weight, mean=0.0, std=std)
 
 
 class AlloyModel(AlloyPreTrainedModel):
