@@ -62,10 +62,12 @@ alloy/
 └── tests/
     ├── _compare_utils.py             # Shared helpers (device/cache/streaming/diff)
     ├── test_construct.py             # Hardware-agnostic smoke test
-    ├── gpu/                          # Full pretrained-weight comparisons
+    ├── gpu/                          # Full pretrained-weight comparisons (CUDA)
     │   ├── compare_qwen3_pretrained.py
     │   └── compare_qwen3_5_pretrained.py
-    └── npu/                          # Memory-constrained comparisons (planned)
+    └── npu/                          # Same comparisons, Ascend NPU (torch_npu + transfer_to_npu)
+        ├── compare_qwen3_pretrained.py
+        └── compare_qwen3_5_pretrained.py
 ```
 
 ## Quick Start
@@ -189,16 +191,24 @@ Tests are split by hardware because NPU and GPU have fundamentally different mem
 # Hardware-agnostic construction + forward-shape smoke test
 python -m alloy.tests.test_construct
 
-# GPU: load real pretrained weights, diff forward + greedy tokens against HF
+# GPU (CUDA): load real pretrained weights, diff forward + greedy tokens against HF
 python -m alloy.tests.gpu.compare_qwen3_pretrained --pretrained Qwen/Qwen3-4B --dtype bf16
 python -m alloy.tests.gpu.compare_qwen3_5_pretrained --pretrained /path/to/Qwen3.5-35B-A3B --dtype bf16
+
+# NPU (Ascend): same protocol, requires torch_npu installed
+python -m alloy.tests.npu.compare_qwen3_pretrained --pretrained Qwen/Qwen3-4B --dtype bf16
+python -m alloy.tests.npu.compare_qwen3_5_pretrained --pretrained /path/to/Qwen3.5-35B-A3B --dtype bf16 --num-layers 4
 ```
 
-The GPU tests execute the following sequential protocol to avoid holding two copies of weights simultaneously:
+The pretrained-weight tests (GPU and NPU) execute the same sequential protocol to avoid holding two copies of weights simultaneously:
 
 1. Load the HF reference model, run forward + greedy generation on a fixed prompt, save CPU logits and generated token ids, release the model from HBM.
 2. Construct the equivalent `AlloyForCausalLM`, stream the state dict directly from the on-disk safetensors shards, run the identical forward + generation.
 3. Compare. Generated token ids must match exactly (`torch.equal`); logits diff statistics (max-abs, mean-abs, relative-max) provide a finer diagnostic.
+
+The NPU scripts add two top-level imports — `import torch_npu` and `from torch_npu.contrib import transfer_to_npu` — so any HF-internal `torch.cuda.*` / `.cuda()` call is monkey-patched to the NPU backend. The model code in `modeling_alloy.py` and `modules/**` stays hardware-agnostic; both reference and ours run on `attn_implementation="eager"` so the only path math can drift is the elementwise + matmul kernels themselves. Default tolerances on NPU match the CUDA script — `attn_implementation="eager"` on both sides means we hold NPU to the same numerical bar.
+
+The qwen3.5-MoE NPU script additionally takes `--num-layers N` (default 4) and truncates *both* the HF reference and the alloy model to their first N layers, loading only those layers' weights from the on-disk safetensors. Qwen3.5-35B-A3B in bf16 is ~70 GB and does not fit on a single Ascend 910B-class card; the truncated comparison still exercises GDN, gated GQA, the shared expert, the top-K router, the grouped experts, partial RoPE, and unit-offset RMSNorm because the first 4 layers cover the canonical 3:1 GDN:full-attention pattern.
 
 Under fp32 eager mode the small-scale random-init comparison against `Qwen3ForCausalLM` produces `max_abs = 0.0` — bit-exact equivalence.
 
