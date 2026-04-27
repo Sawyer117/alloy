@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alloy"
+version = "0.1.0"
+description = "HuggingFace-native library for composing hybrid transformer architectures layer by layer"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    {name = "Sawyer117"},
+]
+keywords = [
+    "pytorch",
+    "transformers",
+    "huggingface",
+    "language-model",
+    "hybrid-attention",
+    "moe",
+    "research",
+]
+dependencies = [
+    "torch>=2.0",
+    "transformers",
+    "safetensors",
+]
+
+[project.urls]
+Repository = "https://github.com/Sawyer117/alloy"
+
+# This repo's layout is non-standard: the git root *is* the package root, with
+# `__init__.py` and modules sitting at the top level instead of under a
+# `src/alloy/` or sibling `alloy/` subdirectory. We map it explicitly here so
+# `pip install` ships everything as the `alloy.*` namespace and downstream
+# users just do `from alloy import AlloyConfig, AlloyForCausalLM`.
+[tool.setuptools]
+package-dir = {"alloy" = "."}
+packages = [
+    "alloy",
+    "alloy.modules",
+    "alloy.modules.attention",
+    "alloy.modules.ffn",
+    "alloy.modules.shared",
+    "alloy.tools",
+]
+
+# Tests, examples, scripts intentionally excluded — they're dev / userland code
+# that lives in the repo for clone-and-run workflows but doesn't belong in the
+# installed wheel. Anyone wanting them runs from a clone, not a `pip install`.
