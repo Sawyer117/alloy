@@ -152,6 +152,28 @@ class AlloyPreTrainedModel(PreTrainedModel):
     _supports_sdpa = True
     _is_stateful = True
 
+    @classmethod
+    def _can_set_experts_implementation(cls) -> bool:
+        """Authoritatively report that alloy supports HF's MoE expert dispatch.
+
+        HF's stock heuristic in ``PreTrainedModel._can_set_experts_implementation``
+        opens the modeling file of ``cls`` and grep's for the literal string
+        ``"@use_experts_implementation"``. alloy applies that decorator on
+        ``_Experts`` inside ``alloy/modules/ffn/moe.py``, not in this file, so
+        the heuristic returns False and HF then forces ``_experts_implementation``
+        from the default ``"grouped_mm"`` down to ``"eager"`` for us — while the
+        upstream HF reference (whose modeling file *does* contain that decorator
+        string) keeps ``"grouped_mm"`` and dispatches to
+        ``grouped_mm_experts_forward``. The two paths are mathematically
+        equivalent but compose ops differently; in fp32 they disagree by 1 ulp
+        per MoE layer, which compounds across depth.
+
+        Override the heuristic so alloy picks the same backend HF picks (= same
+        shared function in ``transformers.integrations.moe``) and we get
+        byte-exact match on any backend HF can dispatch to.
+        """
+        return True
+
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
