@@ -131,27 +131,85 @@ def _shifted_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor
 
 
 # ---------------------------------------------------------------------------
+# Per-layer forward hooks — pinpoint where drift starts
+# ---------------------------------------------------------------------------
+def _capture_hook(store: dict[str, torch.Tensor], key: str):
+    """Forward hook that snapshots module output to CPU fp32."""
+    def hook(module, args, output):
+        # HF DecoderLayer returns tuple; alloy returns Tensor.
+        t = output[0] if isinstance(output, tuple) else output
+        store[key] = t.detach().to("cpu", torch.float32)
+    return hook
+
+
+def _attach_layer_hooks(model: torch.nn.Module) -> tuple[dict[str, torch.Tensor], list]:
+    """Hook embed → every decoder layer output → final norm. Returns (store, handles)."""
+    store: dict[str, torch.Tensor] = {}
+    handles = [
+        model.model.embed_tokens.register_forward_hook(_capture_hook(store, "embed")),
+    ]
+    for i, layer in enumerate(model.model.layers):
+        handles.append(layer.register_forward_hook(_capture_hook(store, f"layer_{i}")))
+    handles.append(model.model.norm.register_forward_hook(_capture_hook(store, "final_norm")))
+    return store, handles
+
+
+def _diff(ref: torch.Tensor, ours: torch.Tensor) -> dict[str, float]:
+    ref = ref.to(torch.float32)
+    ours = ours.to(torch.float32)
+    if ref.shape != ours.shape:
+        return {
+            "shape_mismatch": True,
+            "ref_shape": tuple(ref.shape),
+            "our_shape": tuple(ours.shape),
+        }
+    diff = (ref - ours).abs()
+    ref_max = ref.abs().max().clamp_min(1e-12)
+    return {
+        "max_abs": diff.max().item(),
+        "mean_abs": diff.mean().item(),
+        "max_ref_abs": ref.abs().max().item(),
+        "relative_max": (diff.max() / ref_max).item(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Forward + backward + grad collection
 # ---------------------------------------------------------------------------
 def _train_step(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     labels: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Run one forward + backward step. Returns (logits, loss, {param_name: grad})."""
-    model.train()
-    model.zero_grad(set_to_none=True)
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Run one forward + backward step with per-layer forward hooks attached.
 
-    out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
-    logits = out.logits if hasattr(out, "logits") else out[0]
-    loss = _shifted_ce_loss(logits, labels)
-    loss.backward()
+    Returns (logits_cpu_fp32, loss_cpu_fp32, {param_name: grad_cpu_fp32}, {capture_key: tensor_cpu_fp32}).
+    """
+    captures, handles = _attach_layer_hooks(model)
+    try:
+        model.train()
+        model.zero_grad(set_to_none=True)
 
-    grads: dict[str, torch.Tensor] = {}
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            grads[name] = p.grad.detach().to("cpu", torch.float32).clone()
-    return logits.detach().to("cpu", torch.float32), loss.detach().to("cpu", torch.float32), grads
+        out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
+        logits = out.logits if hasattr(out, "logits") else out[0]
+        loss = _shifted_ce_loss(logits, labels)
+        loss.backward()
+
+        grads: dict[str, torch.Tensor] = {}
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                grads[name] = p.grad.detach().to("cpu", torch.float32).clone()
+    finally:
+        for h in handles:
+            h.remove()
+
+    captures["logits"] = logits.detach().to("cpu", torch.float32)
+    return (
+        logits.detach().to("cpu", torch.float32),
+        loss.detach().to("cpu", torch.float32),
+        grads,
+        captures,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +271,11 @@ def main() -> int:
           f"experts={hf_cfg.num_experts}/{hf_cfg.num_experts_per_tok})")
     print(f"      layer_types: {hf_cfg.layer_types}")
 
+    # Force eager attention on HF too — without this, HF picks sdpa by default
+    # and diverges from alloy's eager port at fp32 ulp scale on full_attention
+    # layers. See compare_qwen3_5_pretrained.py: same control there.
+    hf_cfg._attn_implementation = "eager"
+
     torch.manual_seed(args.seed)
     hf_model = Qwen3_5MoeForCausalLM(hf_cfg).to(device=device, dtype=dtype)
 
@@ -223,10 +286,10 @@ def main() -> int:
     labels = input_ids.clone()
 
     print(f"      input_ids: {tuple(input_ids.shape)}  dtype={input_ids.dtype}")
-    print(f"[1/3] HF forward + backward...")
-    hf_logits, hf_loss, hf_grads = _train_step(hf_model, input_ids, labels)
+    print(f"[1/3] HF forward + backward (with per-layer hooks)...")
+    hf_logits, hf_loss, hf_grads, hf_captures = _train_step(hf_model, input_ids, labels)
     print(f"      logits={tuple(hf_logits.shape)}  loss={hf_loss.item():.6f}  "
-          f"grads on {len(hf_grads)} params")
+          f"grads on {len(hf_grads)} params  captures={len(hf_captures)}")
 
     hf_state = {k: v.detach().clone() for k, v in hf_model.state_dict().items()}
 
@@ -261,17 +324,60 @@ def main() -> int:
         if len(res.unexpected_keys) > 5:
             print(f"        - ... and {len(res.unexpected_keys) - 5} more")
 
-    print(f"[2/3] alloy forward + backward...")
-    alloy_logits, alloy_loss, alloy_grads = _train_step(alloy_model, input_ids, labels)
+    print(f"[2/3] alloy forward + backward (with per-layer hooks)...")
+    alloy_logits, alloy_loss, alloy_grads, alloy_captures = _train_step(alloy_model, input_ids, labels)
     print(f"      logits={tuple(alloy_logits.shape)}  loss={alloy_loss.item():.6f}  "
-          f"grads on {len(alloy_grads)} params")
+          f"grads on {len(alloy_grads)} params  captures={len(alloy_captures)}")
 
     # =========================================================================
     # Phase 3: Diff
     # =========================================================================
     print("\n[3/3] === DIFF: alloy vs HF reference ===\n")
 
-    print("Forward logits:")
+    # Per-layer forward drift — pinpoint where divergence starts.
+    keys_in_order = (
+        ["embed"]
+        + [f"layer_{i}" for i in range(args.num_layers)]
+        + ["final_norm", "logits"]
+    )
+    layer_types = [""] + list(hf_cfg.layer_types) + ["", ""]
+
+    print("=== Per-capture-point forward drift ===")
+    header = f"{'capture':<14} {'layer_type':<22} {'max_abs':>12} {'mean_abs':>12} {'rel_max':>12}"
+    print(header)
+    print("-" * len(header))
+    first_div: Optional[str] = None
+    for k, lt in zip(keys_in_order, layer_types):
+        if k not in hf_captures or k not in alloy_captures:
+            print(f"{k:<14} {lt:<22}  (missing capture)")
+            continue
+        d = _diff(hf_captures[k], alloy_captures[k])
+        if d.get("shape_mismatch"):
+            print(f"{k:<14} {lt:<22}  SHAPE MISMATCH ref={d['ref_shape']} ours={d['our_shape']}")
+            continue
+        marker = ""
+        if first_div is None and d["max_abs"] > 0:
+            first_div = k
+            marker = "  <-- first divergence"
+        print(
+            f"{k:<14} {lt:<22} {d['max_abs']:>12.3e} {d['mean_abs']:>12.3e} "
+            f"{d['relative_max']:>12.3e}{marker}"
+        )
+
+    if first_div is None:
+        print("\n  byte-exact at every capture point — alloy == HF")
+    else:
+        print(f"\n  first divergence: {first_div}")
+        print("  Suspect (by capture point):")
+        print("    embed                  -> Embedding load / weight tying / dtype cast")
+        print("    layer_0..N (linear)    -> Qwen35GatedDeltaNet (chunk_rule, conv1d, A_log init)")
+        print("    layer_N (full attn)    -> Qwen3Attention (RoPE, eager_attention_forward, mRoPE flag)")
+        print("    layer_N (any)          -> Qwen35SparseMoE / experts dispatch / RMSNorm unit_offset")
+        print("    final_norm             -> AlloyModel.norm wiring")
+        print("    logits                 -> lm_head tying")
+
+    print()
+    print("=== Forward logits (final layer output) ===")
     fw = diff_logits(hf_logits, alloy_logits)
     for k, v in fw.items():
         print(f"  {k:14s} {v:.6e}")
