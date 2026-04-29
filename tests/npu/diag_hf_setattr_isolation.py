@@ -64,8 +64,8 @@ if _SKIP is None:
 
 
 def _build_hf():
-    """Small qwen3.5-MoE TextConfig: 1 GDN layer + 1 attn layer is enough — the
-    crash is at GDN conv1d, layer_0 hits first.
+    """Mirror compare_training_step_vs_hf row 3 setup: 4-layer 3:1 GDN+attn,
+    hidden=64, seq_len=32, bf16, eager attn.
     """
     from transformers.models.qwen3_5_moe import Qwen3_5MoeForCausalLM
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
@@ -73,7 +73,7 @@ def _build_hf():
     cfg = Qwen3_5MoeTextConfig(
         vocab_size=128,
         hidden_size=64,
-        num_hidden_layers=2,
+        num_hidden_layers=4,
         num_attention_heads=2,
         num_key_value_heads=1,
         head_dim=32,
@@ -82,7 +82,8 @@ def _build_hf():
         hidden_act="silu",
         rms_norm_eps=1e-6,
         attention_dropout=0.0,
-        layer_types=["linear_attention", "full_attention"],
+        layer_types=["linear_attention", "linear_attention",
+                     "linear_attention", "full_attention"],
         linear_num_key_heads=1,
         linear_num_value_heads=2,
         linear_key_head_dim=32,
@@ -147,12 +148,28 @@ def _trial(label: str, attrs_to_set: dict[str, str], model, input_ids):
     set_str = ", ".join(f"{k}={v!r}" for k, v in attrs_to_set.items()) if attrs_to_set else "(no setattr)"
     print(f"\n[{label}] config setattr: {set_str}")
 
+    # Mirror compare_training_step_vs_hf._train_step exactly: train mode +
+    # gradient-enabled forward + manual CE-with-shift loss + backward. The
+    # earlier eval+no_grad rev failed to reproduce, so something in the
+    # train/grad path is the trigger.
     seen, handles = _attach_layer_probes(model)
     try:
-        with torch.no_grad():
-            out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
-        finite = torch.isfinite(out.logits).all().item()
-        print(f"[{label}] OK — logits {tuple(out.logits.shape)}  finite={finite}")
+        model.train()
+        model.zero_grad(set_to_none=True)
+        out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
+        # match compare's loss: shifted CE in fp32
+        import torch.nn.functional as F
+        shift_logits = out.logits[..., :-1, :].contiguous().to(torch.float32)
+        shift_labels = input_ids[..., 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        )
+        loss.backward()
+        finite_logits = torch.isfinite(out.logits).all().item()
+        finite_loss = torch.isfinite(loss).all().item()
+        print(f"[{label}] OK — logits {tuple(out.logits.shape)}  "
+              f"loss={loss.item():.4f}  finite_logits={finite_logits}  finite_loss={finite_loss}")
         ok = True
     except Exception as e:  # noqa: BLE001 — we want every failure mode
         print(f"[{label}] CRASH — {type(e).__name__}: {e}")
@@ -182,7 +199,7 @@ def main() -> int:
     print(f"  layer_types: {cfg.layer_types}")
 
     torch.manual_seed(1)
-    input_ids = torch.randint(0, cfg.vocab_size, (1, 16), device="npu")
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 32), device="npu")
 
     trials = [
         ("trial 0  control",                             {}),
