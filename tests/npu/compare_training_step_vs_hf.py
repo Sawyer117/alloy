@@ -236,7 +236,17 @@ def main() -> int:
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "bf16", "fp16"],
                         help="fp32 for tightest numerical comparison; bf16/fp16 for realistic NPU run.")
     parser.add_argument("--prefer", default="torch", choices=["torch", "flash", "triton"],
-                        help="binder backend to bind alloy with. 'torch' = no activation.")
+                        help="binder backend to bind alloy with. 'torch' = no activation. "
+                             "When != 'torch', binder is also activated on HF so its experts "
+                             "go through ALL_EXPERTS_FUNCTIONS['<prefer>'] (= binder's kernel). "
+                             "GDN on HF stays eager — there is no dispatch hook in HF's "
+                             "Qwen3_5MoeGatedDeltaNet — so GDN-layer drift is expected here.")
+    parser.add_argument("--attn-impl", default="eager", choices=["eager", "sdpa"],
+                        help="attn_implementation for BOTH alloy and HF. Default 'eager' is "
+                             "the byte-exact baseline. 'sdpa' on NPU dispatches to "
+                             "npu_fused_attention (= flash attention 2 on Ascend), and on "
+                             "CUDA dispatches to torch's scaled_dot_product_attention — both "
+                             "sides hit the same kernel either way.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top-grad-diffs", type=int, default=10,
                         help="Print this many params with the worst grad diffs.")
@@ -271,13 +281,22 @@ def main() -> int:
           f"experts={hf_cfg.num_experts}/{hf_cfg.num_experts_per_tok})")
     print(f"      layer_types: {hf_cfg.layer_types}")
 
-    # Force eager attention on HF too — without this, HF picks sdpa by default
-    # and diverges from alloy's eager port at fp32 ulp scale on full_attention
-    # layers. See compare_qwen3_5_pretrained.py: same control there.
-    hf_cfg._attn_implementation = "eager"
+    # Lock both sides to the same attn backend. Default 'eager' for byte-exact
+    # baseline; 'sdpa' on NPU lands on npu_fused_attention (flash attn 2).
+    hf_cfg._attn_implementation = args.attn_impl
 
     torch.manual_seed(args.seed)
     hf_model = Qwen3_5MoeForCausalLM(hf_cfg).to(device=device, dtype=dtype)
+
+    # If binder is active, also flip HF's _experts_implementation so its
+    # MoE experts dispatch through binder's flash kernel via HF's own
+    # ALL_EXPERTS_FUNCTIONS table. (HF's @use_experts_implementation
+    # decorator reads this field at every forward, so setting it after
+    # construction works.) GDN on HF has no dispatch hook — stays eager.
+    if args.prefer != "torch":
+        chosen_hf = _binder.activate(hf_model, prefer=args.prefer)
+        print(f"      activated binder on HF too: {chosen_hf}  "
+              f"(GDN on HF cannot be redirected — drift expected on linear_attn layers)")
 
     # Same input + labels for both sides. Use input_ids as labels so the
     # CE-with-shift sees a well-defined target.
@@ -298,7 +317,7 @@ def main() -> int:
     #          load HF state_dict, forward + backward
     # =========================================================================
     alloy_cfg = alloy_config_from_qwen3_5_text(hf_cfg)
-    alloy_cfg._attn_implementation = "eager"
+    alloy_cfg._attn_implementation = args.attn_impl
 
     if args.prefer != "torch":
         fake = type("M", (), {"config": alloy_cfg})()
