@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -18,6 +19,16 @@ class MixerEntry:
 
 MIXER_REGISTRY: dict[str, MixerEntry] = {}
 FFN_REGISTRY: dict[str, type[nn.Module]] = {}
+
+# Two-level table of swappable per-module implementations:
+#   IMPL_REGISTRY["<module_key>.<sub_function>"]["<impl_name>"] = callable
+# The top-level key uses a dot to mirror the file layout of an external
+# fast-path package (e.g. ``hf_npu_binder/models/qwen3_5_gdn/chunk_rule.py``
+# corresponds to ``"qwen3_5_gdn.chunk_rule"``). The module that defines a
+# dispatch site is responsible for registering the default ``"torch"`` impl
+# at import time; external packages add ``"triton"`` / ``"flash"`` / etc.
+# alongside without modifying alloy.
+IMPL_REGISTRY: dict[str, dict[str, Callable]] = {}
 
 
 def register_mixer(
@@ -80,3 +91,81 @@ def get_ffn(name: str) -> type[nn.Module]:
             f"Did you forget to import the module that defines it?"
         )
     return FFN_REGISTRY[name]
+
+
+def register_implementation(
+    key: str,
+    impl_name: str,
+    fn: Callable,
+    *,
+    override: bool = False,
+) -> None:
+    """Register a swappable implementation of a sub-function for some alloy module.
+
+    ``key`` must be ``"<module_key>.<sub_function>"`` (e.g. ``"qwen3_5_gdn.chunk_rule"``).
+    The dot-form is enforced so the registry stays grep-friendly and mirrors
+    the file layout of external fast-path packages.
+
+    ``impl_name`` is a short user-facing handle (``"torch"``, ``"triton"``,
+    ``"flash"``, ``"npu_fused"``, ...).
+
+    ``override=True`` is required to replace an existing entry — this catches
+    accidental double registration when an external package is imported twice.
+    """
+    if "." not in key:
+        raise ValueError(
+            f"register_implementation key must be '<module>.<sub_fn>', got '{key}'. "
+            f"Examples: 'qwen3_5_gdn.chunk_rule', 'qwen3_5_gdn.causal_conv1d'."
+        )
+    table = IMPL_REGISTRY.setdefault(key, {})
+    if impl_name in table and not override:
+        raise ValueError(
+            f"Implementation '{impl_name}' already registered for {key}. "
+            f"Pass override=True to replace."
+        )
+    table[impl_name] = fn
+
+
+def get_implementation(
+    key: str,
+    impl_name: str,
+    *,
+    fallback: str | None = None,
+) -> Callable:
+    """Look up an implementation registered under ``key``.
+
+    If ``impl_name`` is missing and ``fallback`` is provided, fall back to
+    ``fallback`` (warning the caller). The dispatch site in an alloy module
+    typically passes ``fallback="torch"`` so that picking a backend that hasn't
+    registered every sub-function gracefully degrades to torch for the gaps,
+    rather than blowing up at ``__init__`` time.
+    """
+    if key not in IMPL_REGISTRY:
+        raise KeyError(
+            f"No implementations registered for '{key}'. "
+            f"Did you forget to import the module that defines it?"
+        )
+    table = IMPL_REGISTRY[key]
+    if impl_name in table:
+        return table[impl_name]
+    if fallback is not None and fallback in table:
+        warnings.warn(
+            f"No '{impl_name}' implementation registered for {key}; "
+            f"falling back to '{fallback}'. Available: {sorted(table)}.",
+            stacklevel=2,
+        )
+        return table[fallback]
+    raise KeyError(
+        f"Unknown implementation '{impl_name}' for {key}. Available: {sorted(table)}."
+    )
+
+
+def list_implementations(prefix: str = "") -> dict[str, list[str]]:
+    """Discovery helper. ``prefix=""`` lists everything; ``prefix="qwen3_5_gdn"``
+    filters to one module's sub-functions.
+    """
+    return {
+        k: sorted(v)
+        for k, v in IMPL_REGISTRY.items()
+        if k.startswith(prefix)
+    }

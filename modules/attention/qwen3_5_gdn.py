@@ -6,7 +6,11 @@ from torch import nn
 
 from transformers.activations import ACT2FN
 
-from ..registry import register_mixer
+from ..registry import (
+    get_implementation,
+    register_implementation,
+    register_mixer,
+)
 from ..shared.norm import RMSNormGated
 
 
@@ -171,6 +175,14 @@ def _torch_recurrent_gated_delta_rule(
     return core_attn_out, last_recurrent_state
 
 
+# Default ("torch") implementations of the GDN sub-functions. External
+# fast-path packages (e.g. hf-npu-binder) register additional impl names —
+# "triton", "flash", "npu_fused" — under the same keys at import time.
+register_implementation("qwen3_5_gdn.chunk_rule",     "torch", _torch_chunk_gated_delta_rule)
+register_implementation("qwen3_5_gdn.recurrent_rule", "torch", _torch_recurrent_gated_delta_rule)
+register_implementation("qwen3_5_gdn.causal_conv1d",  "torch", _torch_causal_conv1d_update)
+
+
 @register_mixer("qwen3_5_gdn", attr_name="linear_attn", mask_kind="linear")
 class Qwen35GatedDeltaNet(nn.Module):
     """Port of Qwen3_5MoeGatedDeltaNet.
@@ -217,6 +229,19 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
+        # Resolve sub-function implementations once at construction. Default is
+        # "torch"; external fast-path packages flip ``config._qwen3_5_gdn_implementation``
+        # (or post-construction attribute) to pick their kernels. The field name
+        # follows the mechanical rule ``_<module_key>_implementation`` so binder
+        # packages can broadcast a backend choice across modules without a
+        # lookup table. ``fallback="torch"`` means a backend that registers e.g.
+        # only ``chunk_rule`` still works — the missing entries quietly degrade
+        # to torch.
+        gdn_impl = getattr(config, "_qwen3_5_gdn_implementation", "torch")
+        self._chunk_rule_fn = get_implementation("qwen3_5_gdn.chunk_rule", gdn_impl, fallback="torch")
+        self._recurrent_rule_fn = get_implementation("qwen3_5_gdn.recurrent_rule", gdn_impl, fallback="torch")
+        self._causal_conv1d_fn = get_implementation("qwen3_5_gdn.causal_conv1d", gdn_impl, fallback="torch")
+
     def _alloy_init_weights(self, init_std: float) -> None:
         # The class's own *direct* Parameters only — child nn.Linear / nn.Conv1d
         # / RMSNormGated layers are initialised by the parent traversal hitting
@@ -258,7 +283,7 @@ class Qwen35GatedDeltaNet(nn.Module):
         a = self.in_proj_a(hidden_states)
 
         if use_precomputed_states:
-            mixed_qkv = _torch_causal_conv1d_update(
+            mixed_qkv = self._causal_conv1d_fn(
                 mixed_qkv,
                 conv_state,
                 self.conv1d.weight.squeeze(1),
@@ -288,14 +313,14 @@ class Qwen35GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
         if not use_precomputed_states:
-            core_attn_out, last_recurrent_state = _torch_chunk_gated_delta_rule(
+            core_attn_out, last_recurrent_state = self._chunk_rule_fn(
                 query, key, value, g=g, beta=beta,
                 initial_state=None,
                 output_final_state=cache_params is not None,
                 use_qk_l2norm_in_kernel=True,
             )
         else:
-            core_attn_out, last_recurrent_state = _torch_recurrent_gated_delta_rule(
+            core_attn_out, last_recurrent_state = self._recurrent_rule_fn(
                 query, key, value, g=g, beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=cache_params is not None,

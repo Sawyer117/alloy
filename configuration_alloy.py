@@ -45,6 +45,24 @@ class AlloyConfig(PretrainedConfig):
     linear attention, MLP, MoE, ...) without any fake "section marker" keys cluttering
     the file. Blank lines inside a JSON object are valid whitespace, so round-trip
     through ``save_pretrained`` / ``from_pretrained`` is unchanged.
+
+    **Runtime-only fields (not serialized).**
+    Attributes whose name starts with a single underscore (e.g.
+    ``_qwen3_5_gdn_implementation``) are treated as runtime fast-path
+    selectors — they pick which registered implementation a module dispatches
+    to (``"torch"`` / ``"triton"`` / ``"flash"`` / ``"npu_fused"`` / ...).
+    The field name follows the mechanical rule
+    ``_<module_key>_implementation`` so external fast-path packages can
+    broadcast a backend across modules without a lookup table.
+
+    These do not describe model architecture and are intentionally dropped by
+    ``to_json_string`` so they never leak into the ``config.json`` published
+    on the Hub. Set them post-construction:
+
+    .. code-block:: python
+
+        config = AlloyConfig(...)
+        config._qwen3_5_gdn_implementation = "flash"   # picked up at module __init__
     """
 
     model_type = "alloy"
@@ -261,6 +279,11 @@ class AlloyConfig(PretrainedConfig):
         unchanged.
         """
         base_dict = json.loads(super().to_json_string(use_diff=use_diff))
+
+        # Drop runtime-only fields (leading-underscore attrs). These are
+        # implementation hints (``_gdn_implementation`` etc.) that should
+        # never travel with the model on disk — see class docstring.
+        base_dict = {k: v for k, v in base_dict.items() if not k.startswith("_")}
 
         # Reorder: each group's fields, in order, then a final "leftover" block
         # for anything not covered by the group table.
