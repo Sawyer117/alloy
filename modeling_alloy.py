@@ -179,30 +179,38 @@ class AlloyPreTrainedModel(PreTrainedModel):
     def get_correct_experts_implementation(self, experts_implementation):
         """Accept any backend registered in ``ALL_EXPERTS_FUNCTIONS``.
 
-        Some transformers forks (notably the bytedance internal fork) hardcode
-        a whitelist of allowed ``_experts_implementation`` values inside
-        ``PreTrainedModel.get_correct_experts_implementation`` — at the time
-        of writing, that's ``["eager", "grouped_mm", "batched_mm"]``. They
-        reject any other value at construction time, even when the caller has
-        explicitly registered a new entry into
-        ``transformers.integrations.moe.ALL_EXPERTS_FUNCTIONS`` (e.g.
+        Some older transformers forks (notably the bytedance internal fork
+        circa 5.2.0.dev0) hardcoded a whitelist of allowed
+        ``_experts_implementation`` values inside
+        ``PreTrainedModel.get_correct_experts_implementation`` —
+        ``["eager", "grouped_mm", "batched_mm"]``. They rejected any other
+        value at construction time, even when the caller had explicitly
+        registered a new entry into ``ALL_EXPERTS_FUNCTIONS`` (e.g.
         ``hf_npu_binder`` registering ``"flash"``).
 
-        alloy's contract is that any string already present in
-        ``ALL_EXPERTS_FUNCTIONS`` is a valid choice — that's what HF's
-        ``@use_experts_implementation`` decorator dispatches on at every
-        forward, regardless of the validator's whitelist. We accept those
-        values here and only fall through to the parent (which preserves the
-        whitelist message for genuine typos like ``"grupedmm"``) when the key
-        truly isn't registered anywhere.
+        Upstream transformers v5.7+ already reads
+        ``ALL_EXPERTS_FUNCTIONS.keys()`` dynamically, so its parent
+        implementation handles registered backends correctly *and* preserves
+        useful behaviour like the ``"grouped_mm" → "eager"`` fallback when
+        ``_grouped_mm_can_dispatch`` rejects the hardware. We must NOT
+        bypass that.
+
+        Strategy: try parent first (gets all 5.7+ goodness), and only
+        rescue with our registry check if parent raises a hardcoded-whitelist
+        error. Names truly absent from ``ALL_EXPERTS_FUNCTIONS`` propagate
+        the original error, so genuine typos like ``"grupedmm"`` still fail
+        loudly.
         """
         try:
-            from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
-        except ImportError:
-            ALL_EXPERTS_FUNCTIONS = {}
-        if experts_implementation in ALL_EXPERTS_FUNCTIONS:
-            return experts_implementation
-        return super().get_correct_experts_implementation(experts_implementation)
+            return super().get_correct_experts_implementation(experts_implementation)
+        except (ValueError, KeyError):
+            try:
+                from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
+            except ImportError:
+                raise
+            if experts_implementation in ALL_EXPERTS_FUNCTIONS:
+                return experts_implementation
+            raise
 
     def _init_weights(self, module: nn.Module) -> None:
         """Initialise ``module``'s direct Parameters.
