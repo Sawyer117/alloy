@@ -45,39 +45,35 @@ launcher's `--num-layers 24 --hidden-size 1024 --ffn-hidden-size 2816
 --num-attention-heads 16 --num-query-groups 2 --full-attention-interval 3
 --linear-{key,value}-head-dim 256 --linear-num-{key,value}-heads 4`.
 
-### 1. Generate the model directory
+### 1. Generate the model directory + copy tokenizer
 
 On the NPU machine, after `pip install -e /path/to/alloy`:
 
 ```bash
 TARGET=./hf_models/alloy_qwen3_next_340m
+SRC_TOKENIZER=/path/to/your/tokenizer/dir   # e.g. /home/.../340M-20B-GatedDeltaNet-hybrid-3-1
 
 python -m alloy.examples.package_config_for_hub \
     --config /path/to/alloy/examples/configs/qwen3_next_340m_dense.json \
-    --target $TARGET
+    --target $TARGET \
+    --tokenizer-src $SRC_TOKENIZER
 ```
 
-This writes:
-- `$TARGET/config.json` — the JSON form of the architecture
-- `$TARGET/modeling_alloy.py` — 1-line shim, `from alloy import AlloyForCausalLM`
+This writes into `$TARGET`:
+- `config.json` — the JSON form of the architecture
+- `modeling_alloy.py` — 1-line shim, `from alloy import AlloyForCausalLM`
 - `auto_map` injected into config.json so AutoModelForCausalLM resolves
+- Tokenizer files (`tokenizer.json`, `tokenizer_config.json`,
+  `special_tokens_map.json`, plus any of `tokenizer.model` / `vocab.json` /
+  `merges.txt` / `added_tokens.json` / `chat_template.jinja` /
+  `generation_config.json` that exist in the source). Files absent from
+  the source are skipped silently.
 
-### 2. Copy tokenizer files into the same directory
+`--tokenizer-src` is optional. Without it, the script still produces the
+config + modeling shim and prints a one-line note that you'll need to
+copy tokenizer files manually before training.
 
-MindSpeed-MM's data loader expects the tokenizer next to config.json. Copy
-from your existing tokenizer source (the same path you pass to
-`--tokenizer-name-or-path` in the MindSpeed-LLM bash script):
-
-```bash
-SRC=/path/to/your/tokenizer/dir          # e.g. /home/.../340M-20B-GatedDeltaNet-hybrid-3-1
-for f in tokenizer.json tokenizer_config.json special_tokens_map.json \
-         tokenizer.model vocab.json merges.txt added_tokens.json chat_template.jinja; do
-    [ -f "$SRC/$f" ] && cp "$SRC/$f" "$TARGET/"
-done
-ls "$TARGET/"
-```
-
-### 3. Verify the directory loads via HF AutoConfig
+### 2. Verify the directory loads via HF AutoConfig
 
 ```bash
 python -c "
@@ -95,7 +91,7 @@ OK: AlloyConfig, layers=24, hidden=1024, vocab=32000
 layer_types head: ['qwen3_5_gdn', 'qwen3_5_gdn', 'qwen3_5_gdn', 'qwen3_attention', 'qwen3_5_gdn', 'qwen3_5_gdn']
 ```
 
-### 4. Pick the yaml template + tweak data paths
+### 3. Pick the yaml template + tweak data paths
 
 ```bash
 cp /path/to/alloy/examples/train/pretrain_alloy_qwen3_next_340m_mindspeed.yaml \
@@ -118,7 +114,7 @@ If your `model_name_or_path` differs from `./hf_models/alloy_qwen3_next_340m`,
 update both occurrences (one in `data.dataset_param.preprocess_parameters.model_name_or_path`,
 one in `model.model_name_or_path`).
 
-### 5. Map MindSpeed-LLM bash hyperparameters → yaml
+### 4. Map MindSpeed-LLM bash hyperparameters → yaml
 
 The yaml ships with the values from a typical 340M qwen3-next launcher;
 double-check against your bash:
@@ -135,7 +131,7 @@ double-check against your bash:
 | `--use-triton-gdn` | `model._qwen3_5_gdn_implementation: triton` | yaml ships `torch`; flip to `triton` to use binder's GDN fast path |
 | `--lr-warmup-iters 1024` | `training.lr_warmup_ratio: 0.01` | 1024 / 101726 ≈ 0.01 |
 
-### 6. Adapt the launcher script
+### 5. Adapt the launcher script
 
 Take an existing MindSpeed-MM launcher (e.g.
 `scripts_qwen3_5/pretrain-exp4_qwen3_5_10b-a2b_optimized.sh`), change only
@@ -192,15 +188,12 @@ with open("my_config.json", "w") as f:
 ### 2. Run `package_config_for_hub` against it
 
 Same command as in step 1 of the walkthrough — feeds the JSON in, drops
-config.json + modeling shim + auto_map at the target.
+config.json + modeling shim + auto_map at the target. Pass
+``--tokenizer-src /path/to/tokenizer/dir`` to also copy tokenizer files
+into the target in one shot; omit the flag if you want to copy tokenizer
+files yourself later.
 
-### 3. Copy tokenizer files (always manual)
-
-`package_config_for_hub` does NOT copy tokenizer — tokenizers are
-architecture-independent and you typically already have one on disk that
-you trust. Same `cp` loop as step 2 of the walkthrough.
-
-### 4. Pick the matching yaml template, adjust `hook_modules` ranges
+### 3. Pick the matching yaml template, adjust `hook_modules` ranges
 
 Yaml templates ship with `model.layers.{0-N}` ranges that need to match
 your `num_hidden_layers`:

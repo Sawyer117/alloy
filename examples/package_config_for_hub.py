@@ -10,7 +10,11 @@ What it does
 3. Verifies the directory by re-loading via
    ``AutoConfig.from_pretrained(target, trust_remote_code=True)`` and asserting
    the round-trip preserves layer / FFN types.
-4. (Optional) ``--build-model`` instantiates ``AlloyForCausalLM`` from the
+4. (Optional) ``--tokenizer-src``: copies tokenizer files from a source
+   directory into ``--target`` so downstream trainers (e.g. MindSpeed-MM)
+   can find the tokenizer next to ``config.json`` without an extra ``cp``
+   step. Skipped silently if the flag is not provided.
+5. (Optional) ``--build-model`` instantiates ``AlloyForCausalLM`` from the
    loaded config via ``AutoModelForCausalLM.from_config``. Costs HBM equal to
    one fp32 random-init copy of the model — for big configs (35B-A3B) skip
    this step, the config round-trip is the actual deliverable.
@@ -47,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -56,6 +61,24 @@ from alloy import AlloyConfig
 from alloy.tools.export_for_hub import export_for_hub
 
 
+# Tokenizer files we look for under --tokenizer-src. The set is generous on
+# purpose — different tokenizer families ship different combinations
+# (sentencepiece uses tokenizer.model, BPE uses vocab.json+merges.txt, GPT2-style
+# may include added_tokens.json, chat-tuned models add chat_template.jinja).
+# Files that don't exist in the source are silently skipped.
+_TOKENIZER_FILE_NAMES: tuple[str, ...] = (
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "tokenizer.model",
+    "vocab.json",
+    "merges.txt",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "generation_config.json",
+)
+
+
 def _load_config(path: Path) -> AlloyConfig:
     with open(path, encoding="utf-8") as f:
         cfg_dict = json.load(f)
@@ -63,6 +86,27 @@ def _load_config(path: Path) -> AlloyConfig:
     cfg_dict.pop("model_type", None)
     cfg_dict.pop("transformers_version", None)
     return AlloyConfig(**cfg_dict)
+
+
+def _copy_tokenizer(src: Path, target: Path) -> list[str]:
+    """Copy tokenizer files from ``src`` directory to ``target``.
+
+    Walks ``_TOKENIZER_FILE_NAMES`` and copies any that exist in ``src``;
+    files absent from ``src`` are skipped silently. Returns the list of
+    filenames actually copied (sorted).
+    """
+    if not src.is_dir():
+        raise NotADirectoryError(
+            f"--tokenizer-src must be a directory, got {src} (is_dir={src.is_dir()})"
+        )
+    copied: list[str] = []
+    for name in _TOKENIZER_FILE_NAMES:
+        s = src / name
+        if not s.is_file():
+            continue
+        shutil.copy2(s, target / name)
+        copied.append(name)
+    return sorted(copied)
 
 
 def main() -> int:
@@ -76,6 +120,14 @@ def main() -> int:
                         help="Also instantiate AlloyForCausalLM via "
                              "AutoModelForCausalLM.from_config to verify the round-trip "
                              "produces a usable model class. Costs HBM = one fp32 copy.")
+    parser.add_argument("--tokenizer-src", default=None,
+                        help="(Optional) Directory to copy tokenizer files from into --target. "
+                             "Looks for tokenizer.json / tokenizer_config.json / "
+                             "special_tokens_map.json / tokenizer.model / vocab.json / "
+                             "merges.txt / added_tokens.json / chat_template.jinja / "
+                             "generation_config.json — copies whichever exist, skips the rest. "
+                             "Omitted: tokenizer copy step is skipped silently (target dir "
+                             "still gets config.json + modeling shim).")
     args = parser.parse_args()
 
     target = Path(args.target).resolve()
@@ -95,6 +147,19 @@ def main() -> int:
     files = sorted(p.name for p in target.iterdir())
     print(f"[2/3] Materialized HF-Hub-loadable repo at {target}")
     print(f"      Files: {files}")
+
+    # ----- 2b. (Optional) Copy tokenizer files ------------------------ #
+    if args.tokenizer_src is not None:
+        src = Path(args.tokenizer_src).resolve()
+        copied = _copy_tokenizer(src, target)
+        if copied:
+            print(f"[2b ] Copied {len(copied)} tokenizer file(s) from {src}: {copied}")
+        else:
+            print(f"[2b ] WARNING — no tokenizer files found under {src}. "
+                  f"Looked for: {list(_TOKENIZER_FILE_NAMES)}")
+    else:
+        print(f"[2b ] Skipped tokenizer copy (no --tokenizer-src given). "
+              f"You can `cp` tokenizer files into {target} manually before training.")
 
     # ----- 3. Round-trip verification --------------------------------- #
     from transformers import AutoConfig
