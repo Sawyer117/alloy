@@ -31,12 +31,14 @@ except ImportError:
 from alloy import AlloyConfig
 from alloy.modules.attention.qwen3_5_gdn import Qwen35GatedDeltaNet
 from alloy.modules.registry import list_implementations
+from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
 
 # Importing the bridge has the side effect of registering binder backends.
 import alloy.integrations.hf_npu_binder as bridge
 from hf_npu_binder.qwen3_5_moe import (
     causal_conv1d as _hf_causal_conv1d,
     chunk_gated_delta_rule as _hf_chunk_gdr,
+    experts as _hf_experts,
     fused_recurrent_gated_delta_rule as _hf_recurrent_gdr,
 )
 
@@ -97,8 +99,13 @@ def test_activate_broadcast() -> None:
     cfg = _gdn_config()
     model = type("FakeModel", (), {"config": cfg})()
     chosen = bridge.activate(model, prefer="flash")
-    assert chosen == {"_qwen3_5_gdn_implementation": "flash"}, chosen
+    expected = {
+        "_qwen3_5_gdn_implementation": "flash",
+        "_experts_implementation":     "flash",
+    }
+    assert chosen == expected, chosen
     assert getattr(cfg, "_qwen3_5_gdn_implementation") == "flash"
+    assert getattr(cfg, "_experts_implementation") == "flash"
 
 
 def test_activate_explicit_mapping_with_bare_module_key() -> None:
@@ -107,6 +114,20 @@ def test_activate_explicit_mapping_with_bare_module_key() -> None:
     chosen = bridge.activate(model, prefer={"qwen3_5_gdn": "triton"})
     assert chosen == {"_qwen3_5_gdn_implementation": "triton"}
     assert getattr(cfg, "_qwen3_5_gdn_implementation") == "triton"
+
+
+def test_bridge_registers_experts_into_hf_table() -> None:
+    """The whole MoE experts forward (permute + gmm + swiglu + gmm + unpermute)
+    is one HF dispatch entry — registered into ``ALL_EXPERTS_FUNCTIONS``,
+    not into alloy's IMPL_REGISTRY.
+    """
+    assert "flash" in ALL_EXPERTS_FUNCTIONS, (
+        f"expected 'flash' in HF ALL_EXPERTS_FUNCTIONS after bridge import; "
+        f"got {sorted(ALL_EXPERTS_FUNCTIONS)}"
+    )
+    assert ALL_EXPERTS_FUNCTIONS["flash"] is _hf_experts.flash, (
+        "HF table 'flash' entry is not the binder callable — wiring drift"
+    )
 
 
 def test_constructed_layer_routes_to_binder() -> None:
@@ -137,6 +158,7 @@ def test_no_alloy_dep_inside_binder() -> None:
 _TESTS = [
     test_bridge_registers_triton_and_flash,
     test_bridge_callables_are_binder_originals,
+    test_bridge_registers_experts_into_hf_table,
     test_activate_broadcast,
     test_activate_explicit_mapping_with_bare_module_key,
     test_constructed_layer_routes_to_binder,
