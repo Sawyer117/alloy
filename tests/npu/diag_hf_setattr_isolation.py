@@ -14,14 +14,20 @@ row 2 and row 3 is two attribute assignments on ``hf_model.config``:
     hf_model.config._experts_implementation     = "flash"
     hf_model.config._qwen3_5_gdn_implementation = "flash"
 
-This script runs four trials on the same fresh HF model and reports which
-trial(s) crash. The crash pattern tells us which attribute (or interaction)
-is the actual trigger:
+This script imports the binder bridge (so ``ALL_EXPERTS_FUNCTIONS["flash"]``
+is registered) and then runs four trials on the same fresh HF model.
+The crash pattern tells us which attribute (or interaction) is the actual
+trigger:
 
     trial 0  no setattr                              (= row 2 control)
     trial 1  only _experts_implementation = "flash"
     trial 2  only _qwen3_5_gdn_implementation = "flash"
     trial 3  both set                                (= row 3 reproduction)
+
+Earlier rev forgot to import the bridge — that surfaced a different
+crash (``KeyError: 'flash' is not registered``) which masked the real
+issue. Now bridge is imported up-front to mirror compare_training_step's
+setup exactly.
 
 Usage::
 
@@ -44,6 +50,17 @@ try:
     from torch_npu.contrib import transfer_to_npu  # noqa: F401
 except ImportError as _e:
     _SKIP = f"torch_npu not available ({_e})"
+
+# Import the bridge UP-FRONT so ALL_EXPERTS_FUNCTIONS["flash"] is registered
+# before any model construction or forward — exactly mirrors what
+# compare_training_step_vs_hf.py does. Without this, trial 1/3 would crash
+# with `KeyError: 'flash' not registered` rather than the original GDN
+# dtype mismatch we're trying to isolate.
+if _SKIP is None:
+    try:
+        import alloy.integrations.hf_npu_binder  # noqa: F401  -- side effect: registers "flash"
+    except ImportError as _e:
+        _SKIP = f"alloy.integrations.hf_npu_binder not importable ({_e})"
 
 
 def _build_hf():
@@ -89,6 +106,31 @@ def _build_hf():
     return model, cfg
 
 
+def _attach_layer_probes(model):
+    """Attach forward hooks that report (layer_idx, dtype) on entry to each
+    sub-step of GDN, so a crash narrows down to the exact op.
+    """
+    seen: list[tuple[str, torch.dtype]] = []
+
+    def make(name):
+        def hook(module, args, output):
+            t = output[0] if isinstance(output, tuple) else output
+            if isinstance(t, torch.Tensor):
+                seen.append((name, t.dtype))
+        return hook
+
+    handles = []
+    handles.append(model.model.embed_tokens.register_forward_hook(make("embed")))
+    for i, layer in enumerate(model.model.layers):
+        handles.append(layer.register_forward_hook(make(f"layer_{i}")))
+        # GDN sub-probes (only on linear_attention layers)
+        if hasattr(layer, "linear_attn"):
+            la = layer.linear_attn
+            handles.append(la.in_proj_qkv.register_forward_hook(make(f"layer_{i}.in_proj_qkv")))
+            handles.append(la.conv1d.register_forward_hook(make(f"layer_{i}.conv1d")))
+    return seen, handles
+
+
 def _trial(label: str, attrs_to_set: dict[str, str], model, input_ids):
     """Set the requested attrs on model.config, run forward, report success/error."""
     # Reset any previous setattrs so trials don't bleed.
@@ -105,20 +147,29 @@ def _trial(label: str, attrs_to_set: dict[str, str], model, input_ids):
     set_str = ", ".join(f"{k}={v!r}" for k, v in attrs_to_set.items()) if attrs_to_set else "(no setattr)"
     print(f"\n[{label}] config setattr: {set_str}")
 
+    seen, handles = _attach_layer_probes(model)
     try:
         with torch.no_grad():
             out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
         finite = torch.isfinite(out.logits).all().item()
         print(f"[{label}] OK — logits {tuple(out.logits.shape)}  finite={finite}")
-        return True
+        ok = True
     except Exception as e:  # noqa: BLE001 — we want every failure mode
         print(f"[{label}] CRASH — {type(e).__name__}: {e}")
         # Trim traceback to the most informative frames (the deepest one).
         tb = traceback.format_exc().splitlines()
-        # Print the last ~12 lines; that includes the deep frame + error.
         for line in tb[-15:]:
             print(f"          {line}")
-        return False
+        ok = False
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Last few capture points + dtypes — shows where we got before the crash.
+    print(f"[{label}] sub-step trace (got to):")
+    for name, dt in seen[-8:]:
+        print(f"          {name:32s} {dt}")
+    return ok
 
 
 def main() -> int:
