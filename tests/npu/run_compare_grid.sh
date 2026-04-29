@@ -61,22 +61,26 @@ COMMON_ARGS=(
 # ---------------------------------------------------------------------------
 # Row matrix
 #   id  prefer  attn-impl  dtype  description
+#
+# fp32 rows are for byte-exact verification (no binder — the triton chunk
+# kernels reject fp32 by design, so binder rows must be bf16).
+# bf16 rows are layered: noise floor → +binder GDN/experts → +sdpa attn.
 # ---------------------------------------------------------------------------
 declare -A ROW_PREFER=(
-    [0]="torch"  [1]="torch"  [2]="flash"  [3]="flash"  [4]="flash"
+    [0]="torch"  [1]="torch"  [2]="torch"  [3]="flash"  [4]="flash"
 )
 declare -A ROW_ATTN=(
-    [0]="eager"  [1]="sdpa"   [2]="eager"  [3]="sdpa"   [4]="sdpa"
+    [0]="eager"  [1]="sdpa"   [2]="eager"  [3]="eager"  [4]="sdpa"
 )
 declare -A ROW_DTYPE=(
-    [0]="fp32"   [1]="fp32"   [2]="fp32"   [3]="fp32"   [4]="bf16"
+    [0]="fp32"   [1]="fp32"   [2]="bf16"   [3]="bf16"   [4]="bf16"
 )
 declare -A ROW_DESC=(
-    [0]="byte-exact baseline (eager attn, no binder)"
-    [1]="sdpa attn, no binder (NPU: npu_fused_attention both sides)"
-    [2]="eager attn, binder ON (GDN drift expected, others should match)"
-    [3]="sdpa attn, binder ON  (all-fast: GDN drift expected, attn+experts match)"
-    [4]="bf16 production-realistic (sdpa + binder, bf16 noise floor)"
+    [0]="byte-exact baseline   (fp32 + eager attn + no binder)"
+    [1]="sdpa kernel parity    (fp32 + sdpa attn, NPU = npu_fused_attention both sides)"
+    [2]="bf16 noise floor      (bf16 + eager attn + no binder — pure bf16 cost)"
+    [3]="bf16 + binder GDN/MoE (bf16 + eager attn + binder; GDN drift expected on HF side)"
+    [4]="bf16 + all-fast       (bf16 + sdpa attn + binder; production-realistic)"
 )
 
 # ---------------------------------------------------------------------------
