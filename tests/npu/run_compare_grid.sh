@@ -93,9 +93,46 @@ SUMMARY="${LOG_DIR}/summary.txt"
     echo "config: layers=${NUM_LAYERS} hidden=${HIDDEN_SIZE} heads=${NUM_ATTENTION_HEADS}/${NUM_KEY_VALUE_HEADS} experts=${NUM_EXPERTS}/${NUM_EXPERTS_PER_TOK} vocab=${VOCAB_SIZE} seq=${SEQ_LEN} batch=${BATCH_SIZE} seed=${SEED}"
     echo "log dir: ${LOG_DIR}"
     echo
-    printf "%-3s  %-7s  %-9s  %-5s  %s\n" "row" "prefer" "attn-impl" "dtype" "result"
-    echo "----------------------------------------------------------------------------"
+    printf "%-3s  %-7s  %-9s  %-5s  %-12s  %-12s  %-12s  %-12s  %-12s  %s\n" \
+        "row" "prefer" "attn-impl" "dtype" \
+        "logits_max" "logits_mean" "loss_diff" "grad_max" "grad_mean" "first divergence"
+    echo "------------------------------------------------------------------------------------------------------------------------------"
 } | tee "${SUMMARY}"
+
+# ---------------------------------------------------------------------------
+# Metric extractors — read a row's log, return one number / token, or "-"
+# ---------------------------------------------------------------------------
+_extract_logit_max() {
+    awk '
+        /^=== Forward logits/ { in_block=1; next }
+        /^===/ && in_block { exit }
+        in_block && /max_abs/ { print $2; exit }
+    ' "$1"
+}
+
+_extract_logit_mean() {
+    awk '
+        /^=== Forward logits/ { in_block=1; next }
+        /^===/ && in_block { exit }
+        in_block && /mean_abs/ { print $2; exit }
+    ' "$1"
+}
+
+_extract_loss_diff() {
+    grep -E "^Loss:" "$1" | sed -nE 's/.*abs_diff=([0-9.eE+-]+).*/\1/p' | head -1
+}
+
+_extract_grad_max() {
+    grep -E "Aggregate over" "$1" | sed -nE 's/.*max-of-max-abs=([0-9.eE+-]+).*/\1/p' | head -1
+}
+
+_extract_grad_mean() {
+    grep -E "Aggregate over" "$1" | sed -nE 's/.*mean-of-mean-abs=([0-9.eE+-]+).*/\1/p' | head -1
+}
+
+_or_dash() {
+    if [[ -z "$1" ]]; then echo "-"; else echo "$1"; fi
+}
 
 run_row() {
     local row="$1"
@@ -126,20 +163,31 @@ run_row() {
     local rc=${PIPESTATUS[0]}
     set -e
 
-    # Extract the headline result line for the summary table.
+    # Headline: where (if anywhere) drift starts.
     local headline
     if grep -qE "byte-exact at every capture point" "${log}"; then
         headline="byte-exact"
     elif grep -qE "first divergence:" "${log}"; then
         headline="$(grep -oE 'first divergence: [a-z_0-9]+' "${log}" | head -1)"
     elif grep -qE "^SKIP" "${log}"; then
-        headline="SKIP ($(grep -m1 -oE 'SKIP.*' "${log}"))"
+        headline="SKIP"
     else
-        headline="(rc=${rc}; see log)"
+        headline="rc=${rc}; see log"
     fi
 
-    printf "%-3s  %-7s  %-9s  %-5s  %s\n" \
-        "${row}" "${prefer}" "${attn}" "${dtype}" "${headline}" \
+    # Numerical metrics.
+    local logits_max  logits_mean  loss_diff  grad_max  grad_mean
+    logits_max="$(_or_dash "$(_extract_logit_max "${log}")")"
+    logits_mean="$(_or_dash "$(_extract_logit_mean "${log}")")"
+    loss_diff="$(_or_dash "$(_extract_loss_diff "${log}")")"
+    grad_max="$(_or_dash "$(_extract_grad_max "${log}")")"
+    grad_mean="$(_or_dash "$(_extract_grad_mean "${log}")")"
+
+    printf "%-3s  %-7s  %-9s  %-5s  %-12s  %-12s  %-12s  %-12s  %-12s  %s\n" \
+        "${row}" "${prefer}" "${attn}" "${dtype}" \
+        "${logits_max}" "${logits_mean}" "${loss_diff}" \
+        "${grad_max}" "${grad_mean}" \
+        "${headline}" \
         | tee -a "${SUMMARY}"
 }
 
