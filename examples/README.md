@@ -1,7 +1,17 @@
 # Examples
 
-Two entry points for building an `AlloyForCausalLM` and running it end-to-end
-(load a real checkpoint, generate a continuation).
+Entry points for building an `AlloyForCausalLM` and running it end-to-end
+(load a real checkpoint, generate a continuation), plus packaging /
+training helpers.
+
+## Quick links
+
+| What I want to do | Go to |
+|---|---|
+| Build a model from JSON config + load a real ckpt + generate | [`build_from_config.py`](#build_from_configpy--declarative) below |
+| Build a model in Python + load an HF Qwen3 ckpt + generate | [`build_from_python.py`](#build_from_pythonpy--programmatic) below |
+| Package an alloy config (+ tokenizer) into a Hub-loadable dir | [`package_config_for_hub.py`](package_config_for_hub.py) |
+| **Train alloy with MindSpeed-MM (FSDP2)** | **[`train/README_mindspeed_mm.md`](train/README_mindspeed_mm.md)** |
 
 ## `build_from_config.py` — declarative
 

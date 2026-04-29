@@ -6,7 +6,7 @@
 
 Mix grouped-query attention, gated DeltaNet, MoE, and dense MLP in arbitrary proportions — the architecture is fully described by two ordered lists, `layer_types` and `ffn_types`, no forking or `modeling_*.py` rewrites required.
 
-[Updates](#-updates) • [Why Alloy](#-why-alloy) • [How it works](#-how-it-works) • [Quick start](#-quick-start) • [Built-in modules](#-built-in-modules) • [Testing](#-testing) • [Roadmap](#-roadmap)
+[Updates](#-updates) • [Why Alloy](#-why-alloy) • [How it works](#-how-it-works) • [Quick start](#-quick-start) • [Training](#-training) • [Built-in modules](#-built-in-modules) • [Testing](#-testing) • [Roadmap](#-roadmap)
 
 </div>
 
@@ -71,24 +71,43 @@ alloy/
 │       ├── norm.py                   # RMSNorm with unit_offset flag
 │       ├── rotary.py                 # RoPE with partial + interleaved-mRoPE support
 │       └── attention_kernels.py      # eager_attention_forward, repeat_kv
+├── integrations/
+│   ├── hf_npu_binder.py              # Bridge to hf-npu-binder (registers triton/flash kernels)
+│   └── mindspeed_mm.py                # Bridge to MindSpeed-MM trainer (registers model_id="alloy")
+├── tools/
+│   └── export_for_hub.py              # Build a Hub-loadable dir: config.json + modeling shim + auto_map
 ├── examples/
 │   ├── build_from_config.py          # JSON-driven model build + load + generate
 │   ├── build_from_python.py          # Programmatic model build + load + generate
-│   └── configs/
-│       ├── qwen3_4b.json
-│       └── qwen3_5_35b_a3b.json
+│   ├── package_config_for_hub.py     # Generate Hub-style model dir + (optional) copy tokenizer
+│   ├── configs/
+│   │   ├── qwen3_4b.json
+│   │   ├── qwen3_5_35b_a3b.json
+│   │   ├── qwen3_next_340m_dense.json
+│   │   └── qwen3_next_1_3b_dense.json
+│   └── train/
+│       ├── README_mindspeed_mm.md     # ★ Training workflow doc (start here)
+│       ├── pretrain_alloy_qwen3_dense_mindspeed.yaml      # qwen3 dense, no GDN no MoE
+│       ├── pretrain_alloy_qwen3_next_340m_mindspeed.yaml  # qwen3-next, GDN dense
+│       └── pretrain_alloy_qwen3_5_moe_mindspeed.yaml      # qwen3.5-MoE, GDN + MoE
 ├── scripts/
 │   ├── compare_qwen3.py              # Small-scale Qwen3 equivalence demo
 │   └── compare_qwen3_5.py            # Small-scale Qwen3.5-MoE equivalence demo
 └── tests/
     ├── _compare_utils.py             # Shared helpers (device/cache/streaming/diff)
     ├── test_construct.py             # Hardware-agnostic smoke test
+    ├── test_impl_registry.py         # IMPL_REGISTRY (per-module fast-path dispatch)
+    ├── test_hf_npu_binder_integration.py   # Bridge end-to-end (skipped without binder)
     ├── gpu/                          # CUDA pretrained-weight comparisons
     │   ├── compare_qwen3_pretrained.py
     │   └── compare_qwen3_5_pretrained.py
     └── npu/                          # Ascend NPU comparisons (torch_npu + transfer_to_npu)
         ├── compare_qwen3_pretrained.py
-        └── compare_qwen3_5_pretrained.py
+        ├── compare_qwen3_5_pretrained.py
+        ├── compare_binder_vs_torch.py            # Speed + precision: binder ON vs OFF
+        ├── compare_training_step_vs_hf.py        # Speed + precision: alloy(±binder) vs HF reference
+        ├── run_compare_grid.sh                    # Sweep the validation grid (5 rows)
+        └── debug_layerwise_diff.py
 ```
 
 ## ⚡ Quick start
@@ -159,6 +178,39 @@ config = AlloyConfig(..., layer_types=["my_rwkv"] * 8 + ["qwen3_attention"] * 8,
 ```
 
 `mask_kind` declares which mask the model-level precompute hands this layer (`"causal"`, `"sliding"`, or `"linear"`) — pick whichever matches your forward's expectations. Naming convention: `<source_model>_<kind>` when the implementation is materially copied from a specific upstream model. Alloy's core never knew this mixer existed, and no PR to the library is required to use it.
+
+## 🚂 Training
+
+Alloy plugs into MindSpeed-MM (FSDP2) via a thin plugin shim — `model_id: alloy` in the trainer yaml resolves to `AlloyForCausalLM` through `model_register`, the model directory loads via `AutoConfig.from_pretrained(..., trust_remote_code=True)`, and runtime fast-path dispatch (binder's triton / flash kernels) is selected per-yaml-field without code edits or model-dir regeneration.
+
+The full workflow lives at **[`alloy/examples/train/README_mindspeed_mm.md`](examples/train/README_mindspeed_mm.md)**:
+
+- **Quickstart table** picking the right yaml template based on whether your alloy config has GDN linear-attention layers and/or MoE feed-forward layers
+- **Concrete walkthrough** for a 340M qwen3-next-style dense model — from a `MindSpeed-LLM` `pretrain_*.sh` launcher's hyperparameters all the way to `bash my_launcher.sh`
+- **General workflow** for any custom alloy architecture (3 steps)
+- **Hyperparameter map** (`MBS` / `GBS` / `LR` / `TRAIN_ITERS` / ... → yaml fields)
+- **Switching backends without retraining** (yaml flips `_qwen3_5_gdn_implementation` / `_experts_implementation` between `torch` / `triton` / `flash`)
+- **FSDP plan caveats** for alloy's module path layout (`model.layers.{*}.linear_attn` etc.)
+- **Troubleshooting** for plugin / dispatch / transformers-fork issues
+
+The core recipe in three commands:
+
+```bash
+# 1. Generate the Hub-style model directory + copy tokenizer
+python -m alloy.examples.package_config_for_hub \
+    --config alloy/examples/configs/qwen3_next_340m_dense.json \
+    --target ./hf_models/alloy_qwen3_next_340m \
+    --tokenizer-src /path/to/your/tokenizer/dir
+
+# 2. Pick a yaml template, edit the data + save paths
+cp alloy/examples/train/pretrain_alloy_qwen3_next_340m_mindspeed.yaml \
+   /path/to/scripts/configs/my_run.yaml
+# ...edit my_run.yaml: dataset_dir / dataset / save / etc.
+
+# 3. Launch via the standard MindSpeed-MM trainer
+torchrun $DISTRIBUTED_ARGS mindspeed_mm/fsdp/train/trainer.py \
+    /path/to/scripts/configs/my_run.yaml
+```
 
 ## 🔌 Built-in modules
 
