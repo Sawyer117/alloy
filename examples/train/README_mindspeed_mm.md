@@ -3,7 +3,8 @@
 MindSpeed-MM has a clean plugin system that loads any HuggingFace-native
 model as long as `model_id` resolves through `model_register` and the model
 directory is loadable via `AutoConfig.from_pretrained(..., trust_remote_code=True)`.
-Alloy meets both. This doc walks through the workflow end-to-end.
+Alloy meets both. This doc walks through the workflow end-to-end and ships a
+concrete worked example for a 340M qwen3-next-style dense model.
 
 ## What lives where
 
@@ -11,19 +12,161 @@ Alloy meets both. This doc walks through the workflow end-to-end.
 |---|---|
 | `alloy/integrations/mindspeed_mm.py` | Plugin shim — registers `AlloyForCausalLM` under `model_id="alloy"` and forwards `_<module>_implementation` yaml fields onto the HF config |
 | `alloy/integrations/hf_npu_binder.py` | Binder bridge — registers `triton` / `flash` fast-path kernels into alloy + HF dispatch tables (optional but recommended on NPU) |
-| `alloy/tools/export_for_hub.py` | Produces the `model_name_or_path` directory: `config.json` + 1-line `modeling_alloy.py` shim + `auto_map` |
-| `examples/train/pretrain_alloy_qwen3_5_moe_mindspeed.yaml` | Example config for qwen3.5-MoE-style alloy (GDN + MoE) |
-| `examples/train/pretrain_alloy_qwen3_dense_mindspeed.yaml` | Example config for qwen3-style dense alloy |
+| `alloy/examples/package_config_for_hub.py` | Generates the model directory (config.json + 1-line modeling shim + auto_map). Run once per model architecture. |
+| `alloy/examples/configs/qwen3_*.json` | Pre-built alloy config JSONs for each model size / architecture flavor |
+| `examples/train/pretrain_alloy_qwen3_5_moe_mindspeed.yaml` | Yaml template — qwen3.5-MoE alloy (**GDN + MoE**) |
+| `examples/train/pretrain_alloy_qwen3_next_340m_mindspeed.yaml` | Yaml template — qwen3-next 340M alloy (**GDN, no MoE**) |
+| `examples/train/pretrain_alloy_qwen3_dense_mindspeed.yaml` | Yaml template — qwen3 dense alloy (**no GDN, no MoE**) |
 
-## End-to-end workflow
+## Quickstart: which template fits your model
 
-### 1. Freeze the model architecture into a Hub-style directory
+Pick the yaml template based on whether your alloy config has GDN linear-attention
+layers and/or MoE feed-forward layers:
+
+| your alloy `layer_types` | your `ffn_types` | template |
+|---|---|---|
+| includes `qwen3_5_gdn` | includes `qwen3_5_moe` | `pretrain_alloy_qwen3_5_moe_mindspeed.yaml` |
+| includes `qwen3_5_gdn` | all `qwen3_mlp` | `pretrain_alloy_qwen3_next_340m_mindspeed.yaml` |
+| only `qwen3_attention*` | all `qwen3_mlp` | `pretrain_alloy_qwen3_dense_mindspeed.yaml` |
+
+The three differ in FSDP `apply_modules` paths (whether `linear_attn` or
+`mlp.experts` entries are needed) and whether `expert_parallel_size` /
+`router_aux_loss_coef` are configured.
+
+---
+
+## Concrete walkthrough: qwen3-next-340m-dense
+
+This walks you through the **exact** flow assuming an alloy config matching
+the existing `examples/configs/qwen3_next_340m_dense.json` — 24 layers in
+3:1 GDN/full-attention pattern, dense MLP, hidden=1024, vocab=32000. The
+config corresponds 1:1 to a typical MindSpeed-LLM `pretrain_*.sh`
+launcher's `--num-layers 24 --hidden-size 1024 --ffn-hidden-size 2816
+--num-attention-heads 16 --num-query-groups 2 --full-attention-interval 3
+--linear-{key,value}-head-dim 256 --linear-num-{key,value}-heads 4`.
+
+### 1. Generate the model directory
+
+On the NPU machine, after `pip install -e /path/to/alloy`:
+
+```bash
+TARGET=./hf_models/alloy_qwen3_next_340m
+
+python -m alloy.examples.package_config_for_hub \
+    --config /path/to/alloy/examples/configs/qwen3_next_340m_dense.json \
+    --target $TARGET
+```
+
+This writes:
+- `$TARGET/config.json` — the JSON form of the architecture
+- `$TARGET/modeling_alloy.py` — 1-line shim, `from alloy import AlloyForCausalLM`
+- `auto_map` injected into config.json so AutoModelForCausalLM resolves
+
+### 2. Copy tokenizer files into the same directory
+
+MindSpeed-MM's data loader expects the tokenizer next to config.json. Copy
+from your existing tokenizer source (the same path you pass to
+`--tokenizer-name-or-path` in the MindSpeed-LLM bash script):
+
+```bash
+SRC=/path/to/your/tokenizer/dir          # e.g. /home/.../340M-20B-GatedDeltaNet-hybrid-3-1
+for f in tokenizer.json tokenizer_config.json special_tokens_map.json \
+         tokenizer.model vocab.json merges.txt added_tokens.json chat_template.jinja; do
+    [ -f "$SRC/$f" ] && cp "$SRC/$f" "$TARGET/"
+done
+ls "$TARGET/"
+```
+
+### 3. Verify the directory loads via HF AutoConfig
+
+```bash
+python -c "
+from transformers import AutoConfig
+cfg = AutoConfig.from_pretrained('$TARGET', trust_remote_code=True)
+print(f'OK: {type(cfg).__name__}, layers={cfg.num_hidden_layers}, '
+      f'hidden={cfg.hidden_size}, vocab={cfg.vocab_size}')
+print(f'layer_types head: {cfg.layer_types[:6]}')
+"
+```
+
+Expected output:
+```
+OK: AlloyConfig, layers=24, hidden=1024, vocab=32000
+layer_types head: ['qwen3_5_gdn', 'qwen3_5_gdn', 'qwen3_5_gdn', 'qwen3_attention', 'qwen3_5_gdn', 'qwen3_5_gdn']
+```
+
+### 4. Pick the yaml template + tweak data paths
+
+```bash
+cp /path/to/alloy/examples/train/pretrain_alloy_qwen3_next_340m_mindspeed.yaml \
+   /path/to/qwen3.5_omni_creative/scripts_qwen3_5/configs/my_qwen3_next_340m.yaml
+```
+
+Edit the copied yaml — the lines marked with `# set me`:
+
+```yaml
+data:
+  dataset_param:
+    basic_parameters:
+      dataset_dir: /path/to/your/data       # absolute path to your dataset directory
+      dataset: train_part1.json             # filename(s); comma-separated for multiple shards
+training:
+  save: ./intermediate_ckpt                 # checkpoint save directory
+```
+
+If your `model_name_or_path` differs from `./hf_models/alloy_qwen3_next_340m`,
+update both occurrences (one in `data.dataset_param.preprocess_parameters.model_name_or_path`,
+one in `model.model_name_or_path`).
+
+### 5. Map MindSpeed-LLM bash hyperparameters → yaml
+
+The yaml ships with the values from a typical 340M qwen3-next launcher;
+double-check against your bash:
+
+| MindSpeed-LLM bash | yaml field | notes |
+|---|---|---|
+| `MBS=6` | `training.micro_batch_size: 6` | direct |
+| `GBS=48` | `training.gradient_accumulation_steps: <accum>` | `accum = GBS / (MBS × world_size)`. **For 1 node × 8 NPUs, accum = 48/(6×8) = 1**. The yaml ships with 8 (single-card calc) — adjust to your actual world_size. |
+| `LR=2e-3` | `training.lr: 2.0e-3` | direct |
+| `MIN_LR=2e-4` | `training.lr_min: 2.0e-4` | direct |
+| `TRAIN_ITERS=101726` | `training.train_iters: 101726` | direct |
+| `SAVE_ITERS=19235` | `training.save_interval: 19235` | direct |
+| `SEQ_LENGTH=4096` | `data.basic_parameters.cutoff_len: 4096` | direct |
+| `--use-triton-gdn` | `model._qwen3_5_gdn_implementation: triton` | yaml ships `torch`; flip to `triton` to use binder's GDN fast path |
+| `--lr-warmup-iters 1024` | `training.lr_warmup_ratio: 0.01` | 1024 / 101726 ≈ 0.01 |
+
+### 6. Adapt the launcher script
+
+Take an existing MindSpeed-MM launcher (e.g.
+`scripts_qwen3_5/pretrain-exp4_qwen3_5_10b-a2b_optimized.sh`), change only
+the final `torchrun` line to point at your yaml:
+
+```bash
+torchrun $DISTRIBUTED_ARGS mindspeed_mm/fsdp/train/trainer.py \
+    scripts_qwen3_5/configs/my_qwen3_next_340m.yaml \
+    2>&1 | tee ${LOG_DIR}/qwen3_next_340m_${WORLD_SIZE}P_${datename}.log
+```
+
+Then launch:
+
+```bash
+bash my_qwen3_next_340m_launcher.sh localhost 1 0
+```
+
+---
+
+## General workflow (any architecture)
+
+For a new alloy architecture (different vocab, layer count, mix of layer
+types, MoE config):
+
+### 1. Write or pick a config JSON
+
+Use one of `examples/configs/qwen3_*.json` as a starting point, or build
+one programmatically:
 
 ```python
-# Once: produce ./hf_models/alloy_qwen3_5_moe/
 from alloy import AlloyConfig
-from alloy.tools.export_for_hub import export_for_hub
-
 cfg = AlloyConfig(
     vocab_size=151936,
     hidden_size=2048,
@@ -37,54 +180,44 @@ cfg = AlloyConfig(
     num_experts_per_tok=8,
     moe_intermediate_size=512,
     shared_expert_intermediate_size=512,
-    rope_parameters={
-        "rope_type": "default",
-        "rope_theta": 10000.0,
-        "partial_rotary_factor": 0.25,
-    },
+    rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25},
     rms_norm_unit_offset=True,
     attn_output_gate=True,
 )
-export_for_hub(cfg, "./hf_models/alloy_qwen3_5_moe", tokenizer_src="./qwen3_5_tokenizer/")
+import json
+with open("my_config.json", "w") as f:
+    json.dump(cfg.to_dict(), f, indent=2)
 ```
 
-After this step `./hf_models/alloy_qwen3_5_moe/` contains:
-- `config.json` — alloy's PretrainedConfig dump (no `_*` runtime fields)
-- `modeling_alloy.py` — 1-line shim importing `AlloyForCausalLM`
-- tokenizer files (copied from `tokenizer_src`)
+### 2. Run `package_config_for_hub` against it
 
-### 2. Install alloy + binder editable into the training env
+Same command as in step 1 of the walkthrough — feeds the JSON in, drops
+config.json + modeling shim + auto_map at the target.
 
-On the NPU machine:
+### 3. Copy tokenizer files (always manual)
 
-```bash
-pip install -e /path/to/alloy
-pip install -e /path/to/hf-npu-binder
+`package_config_for_hub` does NOT copy tokenizer — tokenizers are
+architecture-independent and you typically already have one on disk that
+you trust. Same `cp` loop as step 2 of the walkthrough.
+
+### 4. Pick the matching yaml template, adjust `hook_modules` ranges
+
+Yaml templates ship with `model.layers.{0-N}` ranges that need to match
+your `num_hidden_layers`:
+
+```yaml
+parallel:
+  fsdp_plan:
+    hook_modules:
+      - model.layers.{0-23}     # for 24 layers — adjust to your N-1
+  recompute_plan:
+    apply_modules:
+      - model.layers.{0-23}     # same
 ```
 
-`mindspeed_mm` and its deps come from the bytedance-ms-mm conda env that
-already has `torch_npu` / `triton` / `transformers` configured.
+---
 
-### 3. Pick a yaml, set the data path, run
-
-```bash
-# Copy one of the templates into your scripts dir
-cp /path/to/alloy/examples/train/pretrain_alloy_qwen3_5_moe_mindspeed.yaml \
-   /path/to/qwen3.5_omni_creative/scripts_qwen3_5/configs/my_alloy_run.yaml
-
-# Edit my_alloy_run.yaml: data.basic_parameters.dataset_dir / dataset / save / etc.
-# Then launch via the standard mindspeed-mm trainer:
-torchrun \
-    --nproc_per_node=8 --nnodes=1 --node_rank=0 \
-    --master_addr=localhost --master_port=6000 \
-    mindspeed_mm/fsdp/train/trainer.py \
-    scripts_qwen3_5/configs/my_alloy_run.yaml
-```
-
-(Use the existing `pretrain-exp4_qwen3_5_10b-a2b_optimized.sh` as a launcher
-template — same env-setup, just point it at the yaml above.)
-
-## What yaml controls (and how it reaches alloy)
+## What each yaml field controls (and how it reaches alloy)
 
 | yaml field | Reaches alloy via | Meaning |
 |---|---|---|
@@ -92,18 +225,20 @@ template — same env-setup, just point it at the yaml above.)
 | `model.model_name_or_path` | `AutoConfig.from_pretrained(...)` | where `config.json` + `modeling_alloy.py` live |
 | `model.trust_remote_code: true` | `AutoConfig.from_pretrained(..., trust_remote_code=True)` | required to load `auto_map` |
 | `model.attn_implementation` | `AutoConfig.from_pretrained(_attn_implementation=...)` | HF standard attn dispatch (`eager` / `sdpa` / `flash_attention_2`) |
-| `model._qwen3_5_gdn_implementation` | `AlloyForCausalLMPlugin.overwrite_transformer_config` → `transformer_config._qwen3_5_gdn_implementation` | alloy GDN backend (`torch` / `triton` / `flash`) |
+| `model._qwen3_5_gdn_implementation` | `overwrite_transformer_config` → `transformer_config._qwen3_5_gdn_implementation` | alloy GDN backend (`torch` / `triton` / `flash`) |
 | `model._experts_implementation` | same | HF / alloy MoE dispatch (`eager` / `grouped_mm` / `batched_mm` / `flash`) |
 | `parallel.fsdp_plan.apply_modules` | mindspeed FSDP wrapping | which alloy submodules get sharded |
 | `parallel.ep_plan.apply_modules` | mindspeed EP wrapping | which alloy submodules participate in expert parallel |
 
-The plugin shim's pattern for `_<key>_implementation` means you can **drop new
-alloy modules with their own dispatch surfaces in alloy core, then expose
-them in yaml without editing the shim**.
+The plugin shim's pattern for `_<key>_implementation` means you can drop
+new alloy modules with their own dispatch surfaces in alloy core, then
+expose them in yaml without editing the shim.
+
+---
 
 ## Switching backends without retraining
 
-Once the model is frozen in `./hf_models/alloy_qwen3_5_moe/`:
+Once the model is frozen in `./hf_models/alloy_*/`:
 
 ```yaml
 # binder OFF (alloy default torch dispatch — byte-exact baseline)
@@ -126,6 +261,8 @@ These are pure yaml knobs. **No alloy code edits, no model dir regeneration.**
 That's the whole point of having alloy's `_<module>_implementation` fields
 runtime-only and never serialised into `config.json`.
 
+---
+
 ## FSDP plan caveats
 
 Alloy's module paths differ from `Qwen3_5MoeForConditionalGeneration` (which
@@ -143,6 +280,18 @@ wraps a vision encoder + a language_model). Alloy is text-only, so:
 The `hook_modules` and `recompute_plan.apply_modules` ranges
 (`model.layers.{0-N}`) must match `num_hidden_layers` in your
 `./hf_models/alloy_*/config.json`.
+
+To verify the patterns against an actual constructed model:
+
+```python
+from transformers import AutoConfig, AutoModelForCausalLM
+cfg = AutoConfig.from_pretrained("./hf_models/alloy_qwen3_next_340m", trust_remote_code=True)
+m = AutoModelForCausalLM.from_config(cfg, trust_remote_code=True)
+for name, _ in m.named_modules():
+    print(name)
+```
+
+---
 
 ## Troubleshooting
 
@@ -163,13 +312,14 @@ python -c "from alloy.integrations.mindspeed_mm import AlloyForCausalLMPlugin; p
 yaml's `training.plugin` list (mindspeed imports plugins in order during
 `Trainer.initialize()`).
 
-**Alloy module paths don't match `apply_modules` patterns** — verify the
-patterns against an actual constructed model:
+**`ValueError: Specified experts_implementation="flash" is not supported`** —
+older transformers fork (5.2.0.dev0) has a hardcoded whitelist in
+`get_correct_experts_implementation`. alloy's `AlloyPreTrainedModel` already
+overrides this, but only for transformers v5.7+ — upgrade if seen.
 
-```python
-from alloy import AlloyConfig, AlloyForCausalLM
-cfg = AlloyConfig.from_pretrained("./hf_models/your_dir", trust_remote_code=True)
-m = AlloyForCausalLM(cfg)
-for name, _ in m.named_modules():
-    print(name)
-```
+**RuntimeError: Input dtype mismatch in conv1d (input fp32, weight bf16)** —
+also a stale transformers fork. v5.7+ fixes the autocast path.
+
+**Alloy module paths don't match `apply_modules` patterns** — print
+`named_modules()` of the constructed model (snippet under "FSDP plan caveats")
+and update the yaml patterns to match exactly.
