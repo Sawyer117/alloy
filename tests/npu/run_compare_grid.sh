@@ -40,6 +40,8 @@ mkdir -p "${LOG_DIR}"
 : "${BATCH_SIZE:=1}"
 : "${SEED:=0}"
 : "${TOP_GRAD_DIFFS:=10}"
+: "${N_WARMUP:=1}"
+: "${N_REPEAT:=3}"
 
 # Subset of rows to run (default: all 5)
 : "${ROWS:=0 1 2 3 4}"
@@ -56,6 +58,8 @@ COMMON_ARGS=(
     --batch-size "${BATCH_SIZE}"
     --seed "${SEED}"
     --top-grad-diffs "${TOP_GRAD_DIFFS}"
+    --n-warmup "${N_WARMUP}"
+    --n-repeat "${N_REPEAT}"
 )
 
 # ---------------------------------------------------------------------------
@@ -93,10 +97,11 @@ SUMMARY="${LOG_DIR}/summary.txt"
     echo "config: layers=${NUM_LAYERS} hidden=${HIDDEN_SIZE} heads=${NUM_ATTENTION_HEADS}/${NUM_KEY_VALUE_HEADS} experts=${NUM_EXPERTS}/${NUM_EXPERTS_PER_TOK} vocab=${VOCAB_SIZE} seq=${SEQ_LEN} batch=${BATCH_SIZE} seed=${SEED}"
     echo "log dir: ${LOG_DIR}"
     echo
-    printf "%-3s  %-7s  %-9s  %-5s  %-12s  %-12s  %-12s  %-12s  %-12s  %s\n" \
+    printf "%-3s  %-7s  %-9s  %-5s  %-12s  %-12s  %-12s  %-12s  %-12s  %-9s  %-9s  %-7s  %s\n" \
         "row" "prefer" "attn-impl" "dtype" \
-        "logits_max" "logits_mean" "loss_diff" "grad_max" "grad_mean" "first divergence"
-    echo "------------------------------------------------------------------------------------------------------------------------------"
+        "logits_max" "logits_mean" "loss_diff" "grad_max" "grad_mean" \
+        "hf_ms" "alloy_ms" "speedup" "first divergence"
+    echo "----------------------------------------------------------------------------------------------------------------------------------------------------------"
 } | tee "${SUMMARY}"
 
 # ---------------------------------------------------------------------------
@@ -128,6 +133,22 @@ _extract_grad_max() {
 
 _extract_grad_mean() {
     grep -E "Aggregate over" "$1" | sed -nE 's/.*mean-of-mean-abs=([0-9.eE+-]+).*/\1/p' | head -1
+}
+
+# Timing extractors. Lines look like:
+#   TIMING hf     forward_ms=21.369  backward_ms=35.039  train_step_ms=56.408
+#   TIMING alloy  forward_ms=18.367  backward_ms=43.729  train_step_ms=62.096
+#   TIMING speedup forward=1.163  backward=0.801  train_step=0.908
+_extract_timing_hf() {
+    grep -E "^TIMING hf" "$1" | sed -nE 's/.*train_step_ms=([0-9.eE+-]+).*/\1/p' | head -1
+}
+
+_extract_timing_alloy() {
+    grep -E "^TIMING alloy" "$1" | sed -nE 's/.*train_step_ms=([0-9.eE+-]+).*/\1/p' | head -1
+}
+
+_extract_timing_speedup() {
+    grep -E "^TIMING speedup" "$1" | sed -nE 's/.*train_step=([0-9.eE+-]+).*/\1/p' | head -1
 }
 
 _or_dash() {
@@ -183,10 +204,17 @@ run_row() {
     grad_max="$(_or_dash "$(_extract_grad_max "${log}")")"
     grad_mean="$(_or_dash "$(_extract_grad_mean "${log}")")"
 
-    printf "%-3s  %-7s  %-9s  %-5s  %-12s  %-12s  %-12s  %-12s  %-12s  %s\n" \
+    # Timing metrics (forward + backward train-step ms; speedup = HF/alloy).
+    local hf_ms  alloy_ms  speedup
+    hf_ms="$(_or_dash "$(_extract_timing_hf "${log}")")"
+    alloy_ms="$(_or_dash "$(_extract_timing_alloy "${log}")")"
+    speedup="$(_or_dash "$(_extract_timing_speedup "${log}")")"
+
+    printf "%-3s  %-7s  %-9s  %-5s  %-12s  %-12s  %-12s  %-12s  %-12s  %-9s  %-9s  %-7s  %s\n" \
         "${row}" "${prefer}" "${attn}" "${dtype}" \
         "${logits_max}" "${logits_mean}" "${loss_diff}" \
         "${grad_max}" "${grad_mean}" \
+        "${hf_ms}" "${alloy_ms}" "${speedup}" \
         "${headline}" \
         | tee -a "${SUMMARY}"
 }

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -213,6 +214,60 @@ def _train_step(
 
 
 # ---------------------------------------------------------------------------
+# Wall-clock timing — forward only and full train step (forward + backward)
+# ---------------------------------------------------------------------------
+def _time_train_step(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    n_warmup: int,
+    n_repeat: int,
+    device: torch.device,
+) -> dict[str, float]:
+    """Returns per-iteration ms for forward-only and full train-step."""
+    sync = torch.npu.synchronize if device.type == "npu" else (
+        torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    )
+    model.train()
+
+    # Warmup runs full train step so caches / autotune kick in.
+    for _ in range(n_warmup):
+        model.zero_grad(set_to_none=True)
+        out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
+        logits = out.logits if hasattr(out, "logits") else out[0]
+        loss = _shifted_ce_loss(logits, labels)
+        loss.backward()
+
+    # Forward-only timing (no_grad to skip autograd graph recording).
+    sync()
+    t0 = time.perf_counter()
+    for _ in range(n_repeat):
+        with torch.no_grad():
+            model(input_ids=input_ids, output_router_logits=False, use_cache=False)
+    sync()
+    forward_ms = (time.perf_counter() - t0) / n_repeat * 1000.0
+
+    # Full train-step timing.
+    sync()
+    t0 = time.perf_counter()
+    for _ in range(n_repeat):
+        model.zero_grad(set_to_none=True)
+        out = model(input_ids=input_ids, output_router_logits=False, use_cache=False)
+        logits = out.logits if hasattr(out, "logits") else out[0]
+        loss = _shifted_ce_loss(logits, labels)
+        loss.backward()
+    sync()
+    train_step_ms = (time.perf_counter() - t0) / n_repeat * 1000.0
+
+    return {
+        "forward_ms": forward_ms,
+        "train_step_ms": train_step_ms,
+        "backward_ms": max(train_step_ms - forward_ms, 0.0),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def _dtype_from_str(s: str) -> torch.dtype:
@@ -250,6 +305,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--top-grad-diffs", type=int, default=10,
                         help="Print this many params with the worst grad diffs.")
+    parser.add_argument("--n-warmup", type=int, default=1,
+                        help="Train-step warmup iterations before timing.")
+    parser.add_argument("--n-repeat", type=int, default=3,
+                        help="Train-step iterations averaged for timing.")
+    parser.add_argument("--no-timing", action="store_true",
+                        help="Skip the timing pass (precision-only run).")
     parser.add_argument("--device", default=None,
                         help="Force device (cpu / cuda / npu). Default: auto-pick best.")
     args = parser.parse_args()
@@ -440,6 +501,35 @@ def main() -> int:
     print(f"    {'name':50s} {'max_abs':>12s} {'mean_abs':>12s} {'rel_max':>12s}")
     for name, d in diffs[:args.top_grad_diffs]:
         print(f"    {name:50s} {d['max_abs']:>12.3e} {d['mean_abs']:>12.3e} {d['relative_max']:>12.3e}")
+
+    # =========================================================================
+    # Phase 4: timing (forward-only + full train step) on the same models /
+    # input. The grid summary parser greps lines starting with "TIMING".
+    # =========================================================================
+    if not args.no_timing:
+        print(f"\n=== Timing (n_warmup={args.n_warmup}, n_repeat={args.n_repeat}) ===")
+        hf_t = _time_train_step(
+            hf_model, input_ids, labels,
+            n_warmup=args.n_warmup, n_repeat=args.n_repeat, device=device,
+        )
+        alloy_t = _time_train_step(
+            alloy_model, input_ids, labels,
+            n_warmup=args.n_warmup, n_repeat=args.n_repeat, device=device,
+        )
+
+        # Print in a parseable format. The bash grid extracts these lines.
+        print(f"TIMING hf     forward_ms={hf_t['forward_ms']:.3f}  "
+              f"backward_ms={hf_t['backward_ms']:.3f}  train_step_ms={hf_t['train_step_ms']:.3f}")
+        print(f"TIMING alloy  forward_ms={alloy_t['forward_ms']:.3f}  "
+              f"backward_ms={alloy_t['backward_ms']:.3f}  train_step_ms={alloy_t['train_step_ms']:.3f}")
+
+        # Speedups (HF / alloy; >1 means alloy faster).
+        def _ratio(num, den):
+            return num / den if den > 0 else 0.0
+        sp_fwd  = _ratio(hf_t["forward_ms"],    alloy_t["forward_ms"])
+        sp_bwd  = _ratio(hf_t["backward_ms"],   alloy_t["backward_ms"])
+        sp_step = _ratio(hf_t["train_step_ms"], alloy_t["train_step_ms"])
+        print(f"TIMING speedup forward={sp_fwd:.3f}  backward={sp_bwd:.3f}  train_step={sp_step:.3f}")
 
     return 0
 
