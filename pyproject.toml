@@ -42,6 +42,7 @@ packages = [
     "alloy.modules.attention",
     "alloy.modules.ffn",
     "alloy.modules.shared",
+    "alloy.integrations",
     "alloy.tools",
 ]
 
