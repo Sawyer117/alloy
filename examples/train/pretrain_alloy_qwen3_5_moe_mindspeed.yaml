@@ -1,0 +1,163 @@
+# Pretraining yaml for an alloy qwen3.5-MoE model under MindSpeed-MM (FSDP2).
+#
+# Adapted from mindspeed_mm/scripts_qwen3_5/configs/qwen3_5_10B-A2B_exp4_config.yaml
+# with three alloy-specific changes:
+#
+#   1. ``model.model_id: alloy`` and the alloy plugin shim under
+#      ``training.plugin`` — replaces mindspeed's bundled qwen3_5_moe model
+#      with our AlloyForCausalLM.
+#
+#   2. FSDP / recompute / EP plan paths use ``model.layers.{*}`` (not
+#      ``model.language_model.layers.{*}``). Alloy's AlloyForCausalLM is a
+#      text-only causal LM — no vision / language_model wrapper — so module
+#      paths are flatter. The mixer attribute on a linear-attention layer is
+#      ``linear_attn`` (matches alloy's MIXER_REGISTRY entry's attr_name).
+#
+#   3. Runtime dispatch via alloy's ``_<module_key>_implementation`` fields
+#      directly on the yaml ``model:`` section — no translation. ``triton``
+#      and ``flash`` are registered by ``alloy.integrations.hf_npu_binder``
+#      at plugin-import time; ``torch`` is alloy's always-available default.
+#
+# The model_name_or_path should point at a directory produced by
+# ``alloy/tools/export_for_hub.py`` — that gives you config.json + the
+# 1-line modeling shim + tokenizer files, which AutoConfig.from_pretrained
+# can load via trust_remote_code=True.
+
+# 并行策略
+parallel:
+  tensor_parallel_size: 1
+  fully_shard_parallel_size: 16
+  fsdp_plan:
+    apply_modules:
+      - model.embed_tokens
+      - model
+      - model.layers.{*}
+      - model.layers.{*}.linear_attn          # GDN mixer (linear_attention layers)
+      - model.layers.{*}.mlp.experts          # MoE expert weights
+      - lm_head
+    hook_modules:
+      - model.layers.{0-19}                   # adjust to match num_hidden_layers
+    param_dtype: bf16
+    reduce_dtype: fp32
+    num_to_forward_prefetch: 1
+    num_to_backward_prefetch: 1
+  recompute: true
+  recompute_plan:
+    apply_modules:
+      - model.layers.{0-19}                   # adjust to match num_hidden_layers
+  ring_attention_size: 1
+  ulysses_parallel_size: 1
+  expert_parallel_size: 1
+  ep_plan:
+    apply_modules:
+      - model.layers.{*}.mlp.experts
+
+# 数据相关配置
+data:
+  dataset_param:
+    dataset_type: huggingface
+    attr:
+      formatting: alpaca
+      prompt: text
+    preprocess_parameters:
+      model_name_or_path: ./hf_models/alloy_qwen3_5_moe   # tokenizer comes from the same dir
+      use_fast_tokenizer: true
+      split_special_tokens: false
+    basic_parameters:
+      cutoff_len: 4096
+      template: default
+      enable_thinking: false
+      train_on_prompt: false
+      mask_history: false
+      dataset_dir: /path/to/your/data           # set me
+      dataset: train_part1.json                 # set me
+      cache_dir: ./cache_dir/
+      overwrite_cache: false
+      preprocessing_batch_size: 1000
+      preprocessing_num_workers: 16
+      max_samples: null
+      packing: true
+      stage: pretrain
+
+  dataloader_param:
+    pin_memory: true
+    shuffle: false
+    dataloader_mode: sampler
+    drop_last: true
+    sampler_type: BaseRandomBatchSampler
+    num_workers: 8
+    collate_param:
+      model_name: llm_pretrain
+      ignore_pad_token_for_loss: true
+
+# 模型配置
+model:
+  model_id: alloy                                  # ← matches model_register.register("alloy")
+  model_name_or_path: ./hf_models/alloy_qwen3_5_moe  # produced by tools/export_for_hub
+  trust_remote_code: true                          # required to load alloy's modeling shim
+  attn_implementation: sdpa                        # standard HF flag (no underscore).
+                                                   # On NPU this dispatches to npu_fused_attention
+                                                   # (= flash attention 2 on Ascend).
+  freeze: []
+  loss_cfg:
+    loss_type: default
+    router_aux_loss_coef: 0.001
+  enable_chunk_loss: false
+  chunkloss_plan:
+    apply_module: lm_head
+    chunk_size: 1024
+
+  # ----- alloy runtime fast-path dispatch (forwarded onto transformer_config
+  # by alloy.integrations.mindspeed_mm.overwrite_transformer_config) -----
+  _qwen3_5_gdn_implementation: torch               # torch | triton | flash  (binder-registered)
+  _experts_implementation: eager                   # eager | grouped_mm | batched_mm | flash (binder)
+
+# 训练配置
+training:
+  micro_batch_size: 2
+  gradient_accumulation_steps: 8
+  seed: 42
+  lr: 4.0e-4
+  lr_min: 4.0e-5
+  lr_decay_style: cosine
+  lr_warmup_ratio: 0.01
+  weight_decay: 1.0e-1
+  train_iters: 15000
+  clip_grad: 1.0
+  init_model_with_meta_device: true
+  optimizer: adamw
+  adam_fused: true
+  save_interval: 10000
+  save: /path/to/your/ckpt_out                     # set me
+  use_deter_comp: false
+  plugin:
+    - alloy.integrations.mindspeed_mm              # registers alloy as model_id="alloy"
+    - alloy.integrations.hf_npu_binder             # registers triton/flash fast paths (optional)
+    - mindspeed_mm/fsdp/data/datasets/huggingface  # standard HF dataset plugin
+
+# 工具配置
+tools:
+  profile:
+    enable: false
+    profile_type: static
+    ranks: [0]
+    static_param:
+      level: level1
+      with_stack: false
+      with_memory: true
+      record_shapes: false
+      with_cpu: true
+      save_path: ./profiling
+      start_step: 10
+      end_step: 11
+      data_simplification: false
+      aic_metrics_type: PipeUtilization
+  memory_profile:
+    enable: false
+    start_step: 1
+    end_step: 2
+    save_path: ./memory_snapshot
+    dump_ranks: [0]
+    stacks: all
+    max_entries: null
+    mem_info: false
