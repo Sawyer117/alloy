@@ -57,8 +57,17 @@ def _update_linear_attn_mask(
         if callable(fn):
             try:
                 has_prev = bool(fn())
-            except TypeError:
-                # DynamicCache exposes has_previous_state(layer_idx); treat len>0 as "prior"
+            except (TypeError, ValueError):
+                # TypeError: signature variant — has_previous_state(layer_idx).
+                # ValueError: HF raises this when called on a Cache with no
+                #   LinearAttention layers (cache_utils.py:1057). Happens when
+                #   the cache was built without seeing canonical layer_types
+                #   on the config (e.g. legacy alloy config.json with
+                #   source-coupled keys still installed externally; or
+                #   externally-instantiated DynamicCache without our config).
+                # Fall back to seq_length, which is semantically equivalent
+                # for the "have we run any forward yet" question this site
+                # is asking.
                 has_prev = past_key_values.get_seq_length() > 0
         else:
             has_prev = past_key_values.get_seq_length() > 0
@@ -303,7 +312,14 @@ class AlloyModel(AlloyPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
+            # DynamicCache reads ``config.layer_types`` (cache_utils.py:1242)
+            # to dispatch each layer to its right cache class — Attention vs
+            # LinearAttention. alloy stores ``layer_types`` in source-coupled
+            # form (``qwen3_5_gdn``); HF only recognises the canonical names
+            # (``linear_attention``). Hand the cache the canonical view via
+            # ``get_text_config`` so GDN layers get LinearAttentionLayer slots
+            # and ``has_previous_state`` queries don't crash later.
+            past_key_values = DynamicCache(config=self.config.get_text_config(decoder=True))
 
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
 

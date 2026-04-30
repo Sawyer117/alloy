@@ -5,20 +5,43 @@ import json
 from transformers.configuration_utils import PretrainedConfig
 
 
-# Translation table from HuggingFace's canonical `layer_types` vocabulary
-# (used inside qwen3 / qwen3.5 modeling code) to alloy's source-coupled
-# registry keys. Lives here so both tests and examples can import it without
-# reaching into private modules.
+# Translation tables between HuggingFace's canonical ``layer_types``
+# vocabulary (used inside qwen3 / qwen3.5 modeling code, and crucially by
+# HF's cache / generate / mask infrastructure to detect hybrid models) and
+# alloy's source-coupled registry keys (which preserve model-architecture
+# provenance — ``qwen3_5_gdn`` says exactly which paper/model this layer
+# came from, where ``linear_attention`` is generic).
+#
+# alloy's user-visible surface (config.json, AlloyConfig.layer_types) holds
+# source-coupled keys. The reverse direction is consumed by
+# :meth:`AlloyConfig.get_text_config` to hand HF library code a translated
+# view, so HF's ``is_linear_attention`` detection in
+# ``transformers.generation.utils._prepare_cache_for_generation`` recognises
+# alloy as a hybrid model.
 HF_LAYER_TYPE_TO_ALLOY: dict[str, str] = {
     "full_attention": "qwen3_attention",
     "sliding_attention": "qwen3_attention_sliding",
     "linear_attention": "qwen3_5_gdn",
 }
 
+ALLOY_LAYER_TYPE_TO_HF: dict[str, str] = {v: k for k, v in HF_LAYER_TYPE_TO_ALLOY.items()}
+
 
 def hf_layer_types_to_alloy(hf_layer_types) -> list[str]:
     """Translate an HF ``layer_types`` list into alloy's registry keys."""
     return [HF_LAYER_TYPE_TO_ALLOY.get(t, t) for t in hf_layer_types]
+
+
+def alloy_layer_types_to_hf(alloy_layer_types) -> list[str]:
+    """Translate alloy's source-coupled ``layer_types`` into HF canonical names.
+
+    Used to expose alloy's layer composition to HF library code (cache,
+    generate, mask helpers) which discriminates by the canonical vocabulary
+    ``"full_attention"`` / ``"sliding_attention"`` / ``"linear_attention"``.
+    Unrecognised entries pass through unchanged so a user who already wrote
+    canonical names (e.g. copied from a HF Qwen3.5 config) still works.
+    """
+    return [ALLOY_LAYER_TYPE_TO_HF.get(t, t) for t in alloy_layer_types]
 
 
 class AlloyConfig(PretrainedConfig):
@@ -234,6 +257,49 @@ class AlloyConfig(PretrainedConfig):
 
         if "qwen3_5_moe" in self.ffn_types and self.num_experts <= 0:
             raise ValueError("ffn_types contains 'qwen3_5_moe' but num_experts <= 0")
+
+    # ------------------------------------------------------------------ #
+    # HF-facing translation: hand library code a canonical-named view
+    # ------------------------------------------------------------------ #
+    def get_text_config(self, decoder: bool = False):
+        """Return a view of this config with HF canonical ``layer_types``.
+
+        HF library code reads ``layer_types`` via ``config.get_text_config()``
+        when it needs to discriminate hybrid architectures — e.g.
+        ``transformers.generation.utils._prepare_cache_for_generation``
+        scans for ``"linear_attention"`` / ``"mamba"`` / ``"conv"`` to decide
+        whether a ``DynamicCache`` needs the config plumbed through so the
+        per-layer cache classes are picked correctly.
+
+        alloy stores ``layer_types`` in source-coupled form
+        (``"qwen3_5_gdn"`` / ``"qwen3_attention"``) on the user-visible
+        surface to preserve model-architecture provenance. This override
+        returns a shallow copy of self with the canonical translation
+        applied, so HF infrastructure sees the names it expects without
+        forcing alloy users to write generic names in their configs.
+
+        Direct access (``self.layer_types``) is unchanged — alloy modules
+        still see source-coupled keys for mixer-registry dispatch.
+        """
+        import copy
+
+        base = super().get_text_config(decoder=decoder)
+        # For alloy (pure-text), the parent typically returns ``self``.
+        # Don't mutate self; return a shallow-copied view with translated
+        # layer_types. For multimodal subclasses where ``base is not self``,
+        # leave the subconfig alone — only translate when we own ``base``.
+        #
+        # ``layer_types`` may not be set yet during ``super().__init__()``
+        # (alloy intentionally defers that assignment to dodge
+        # ``validate_layer_type``). HF's ``validate_token_ids`` validator
+        # calls ``get_text_config`` during that window — fall back to the
+        # untranslated base in that case; once ``__init__`` finishes the
+        # translation activates normally.
+        if base is self and getattr(self, "layer_types", None) is not None:
+            view = copy.copy(self)
+            view.layer_types = alloy_layer_types_to_hf(self.layer_types)
+            return view
+        return base
 
     # ------------------------------------------------------------------ #
     # Validator override: bypass HF's `validate_layer_type` strict check
