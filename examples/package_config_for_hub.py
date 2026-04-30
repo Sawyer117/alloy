@@ -13,7 +13,10 @@ What it does
 4. (Optional) ``--tokenizer-src``: copies tokenizer files from a source
    directory into ``--target`` so downstream trainers (e.g. MindSpeed-MM)
    can find the tokenizer next to ``config.json`` without an extra ``cp``
-   step. Skipped silently if the flag is not provided.
+   step. Skipped silently if the flag is not provided. After copying, if
+   the tokenizer has ``pad_token=null`` (common for LLaMA-family sources
+   like m-a-p HybridDeltaNet), we backfill it to ``eos_token`` and re-save
+   — leaving it null causes a mid-training crash in HF data collators.
 5. (Optional) ``--build-model`` instantiates ``AlloyForCausalLM`` from the
    loaded config via ``AutoModelForCausalLM.from_config``. Costs HBM equal to
    one fp32 random-init copy of the model — for big configs (35B-A3B) skip
@@ -88,6 +91,32 @@ def _load_config(path: Path) -> AlloyConfig:
     return AlloyConfig(**cfg_dict)
 
 
+def _ensure_pad_token(target: Path) -> str | None:
+    """Backfill ``pad_token`` to ``eos_token`` if the copied tokenizer lacks one.
+
+    LLaMA-family sources (e.g. ``m-a-p/340M-20B-GatedDeltaNet-hybrid-3-1``)
+    ship with ``pad_token: null``. Both HF's ``DataCollatorWithPadding`` and
+    mindspeed-mm's packing collator require a non-None pad token; leaving it
+    null produces a ``ValueError: Asking to pad ...`` partway into training,
+    far from where the actual problem lives. Backfilling here keeps the
+    tokenizer well-formed at the artifact boundary.
+
+    Returns the backfilled token string when a fix happened, ``None`` if the
+    source already had ``pad_token`` set (or no usable ``eos_token`` to copy
+    from — in which case we surface a warning to the caller).
+    """
+    from transformers import AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(str(target), trust_remote_code=True)
+    if tok.pad_token is not None:
+        return None
+    if tok.eos_token is None:
+        return None
+    tok.pad_token = tok.eos_token
+    tok.save_pretrained(str(target))
+    return tok.pad_token
+
+
 def _copy_tokenizer(src: Path, target: Path) -> list[str]:
     """Copy tokenizer files from ``src`` directory to ``target``.
 
@@ -154,6 +183,10 @@ def main() -> int:
         copied = _copy_tokenizer(src, target)
         if copied:
             print(f"[2b ] Copied {len(copied)} tokenizer file(s) from {src}: {copied}")
+            backfilled = _ensure_pad_token(target)
+            if backfilled is not None:
+                print(f"[2b ] Backfilled pad_token={backfilled!r} "
+                      f"(source tokenizer had pad_token=null; falling back to eos_token).")
         else:
             print(f"[2b ] WARNING — no tokenizer files found under {src}. "
                   f"Looked for: {list(_TOKENIZER_FILE_NAMES)}")
