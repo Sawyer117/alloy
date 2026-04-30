@@ -28,7 +28,7 @@ from hf_npu_binder.qwen3_5_moe import (
 )
 
 # alloy's own per-module dispatch table (GDN sub-functions live here).
-from alloy.modules.registry import register_implementation
+from alloy.modules.registry import DEFAULT_IMPL, register_implementation
 
 # HuggingFace's MoE experts dispatch table. alloy's ``_Experts`` is wrapped by
 # ``@use_experts_implementation`` and reads ``config._experts_implementation``,
@@ -83,6 +83,19 @@ def _register_all() -> None:
         # of register and tolerates rebinding cleanly.
         ALL_EXPERTS_FUNCTIONS[hf_key] = fn
     _ACTIVATABLE_FIELDS.append("_experts_implementation")
+
+    # Tell alloy modules which backend to default to in the absence of an
+    # explicit config._<module>_implementation field. Source of truth is
+    # binder itself: if the binder package exposes a top-level ``DEFAULTS``
+    # dict, we trust whatever it declares (binder is the package that
+    # actually benchmarked these on hardware and knows which backend wins).
+    # If it doesn't (older binder version), fall back to a safe hardcoded
+    # choice — "triton" matches the verified-stable convention used in
+    # alloy's example yaml templates.
+    binder_defaults: dict[str, str] = getattr(hf_npu_binder, "DEFAULTS", {})
+    DEFAULT_IMPL["qwen3_5_gdn"] = binder_defaults.get(
+        "qwen3_5_moe.chunk_gated_delta_rule", "triton"
+    )
 
 
 _register_all()

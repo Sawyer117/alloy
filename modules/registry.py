@@ -31,6 +31,28 @@ FFN_REGISTRY: dict[str, type[nn.Module]] = {}
 IMPL_REGISTRY: dict[str, dict[str, Callable]] = {}
 
 
+# Per-module-key default backend, populated by external bridges (e.g.
+# ``alloy.integrations.hf_npu_binder``). Empty by default — alloy modules
+# that find no entry here fall back to ``"torch"``.
+#
+# Keys are the bare ``"<module_key>"`` part (e.g. ``"qwen3_5_gdn"``), not
+# the dotted ``"<module_key>.<sub_function>"`` form used in IMPL_REGISTRY.
+# Rationale: a single backend choice ("triton" / "flash" / "tilelang" / ...)
+# typically covers all sub-functions of one module; the per-sub-function
+# split is for callable lookup, not for default selection.
+#
+# Why not hardcode defaults inside alloy modules:
+#   alloy is backend-agnostic — it knows which dispatch surfaces exist but
+#   not which backend is best on a given hardware. Backend-specific
+#   knowledge ("on Ascend 910B, triton beats flash") lives in the package
+#   that ships those kernels (e.g. hf_npu_binder), and that package
+#   declares its preferences via its own bridge populating this dict.
+#   When a future module gets a tilelang backend, the new bridge writes
+#   ``DEFAULT_IMPL["mamba3_ssm"] = "tilelang"`` and alloy core stays
+#   unchanged.
+DEFAULT_IMPL: dict[str, str] = {}
+
+
 def register_mixer(
     name: str,
     attr_name: str,

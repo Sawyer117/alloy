@@ -229,15 +229,22 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
 
-        # Resolve sub-function implementations once at construction. Default is
-        # "torch"; external fast-path packages flip ``config._qwen3_5_gdn_implementation``
-        # (or post-construction attribute) to pick their kernels. The field name
-        # follows the mechanical rule ``_<module_key>_implementation`` so binder
-        # packages can broadcast a backend choice across modules without a
-        # lookup table. ``fallback="torch"`` means a backend that registers e.g.
-        # only ``chunk_rule`` still works — the missing entries quietly degrade
-        # to torch.
-        gdn_impl = getattr(config, "_qwen3_5_gdn_implementation", "torch")
+        # Resolve sub-function implementations once at construction.
+        # Selection priority:
+        #   1. ``config._qwen3_5_gdn_implementation`` (user / bridge.activate())
+        #   2. ``DEFAULT_IMPL["qwen3_5_gdn"]`` (set by an external bridge that
+        #      registered backends, e.g. alloy.integrations.hf_npu_binder reads
+        #      hf_npu_binder.DEFAULTS to pick "triton" / "flash" / ...)
+        #   3. ``"torch"`` — alloy's in-tree reference, always available.
+        # ``fallback="torch"`` on each lookup means a backend that registers
+        # only some sub-functions still works — the missing entries quietly
+        # degrade to torch instead of crashing __init__.
+        from ..registry import DEFAULT_IMPL
+        gdn_impl = getattr(
+            config,
+            "_qwen3_5_gdn_implementation",
+            DEFAULT_IMPL.get("qwen3_5_gdn", "torch"),
+        )
         self._chunk_rule_fn = get_implementation("qwen3_5_gdn.chunk_rule", gdn_impl, fallback="torch")
         self._recurrent_rule_fn = get_implementation("qwen3_5_gdn.recurrent_rule", gdn_impl, fallback="torch")
         self._causal_conv1d_fn = get_implementation("qwen3_5_gdn.causal_conv1d", gdn_impl, fallback="torch")
