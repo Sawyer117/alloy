@@ -6,6 +6,15 @@ directory is loadable via `AutoConfig.from_pretrained(..., trust_remote_code=Tru
 Alloy meets both. This doc walks through the workflow end-to-end and ships a
 concrete worked example for a 340M qwen3-next-style dense model.
 
+> **Prerequisite — apply MindSpeed-MM patches first.** Before training will
+> actually run end-to-end, three upstream sites in MindSpeed-MM need small
+> patches (parquet dataloader; loss_func `**kwargs` sink; defensive
+> `output.aux_loss` access). See
+> [`mindspeed_mm_patches.md`](./mindspeed_mm_patches.md) for the diffs and
+> rationale. These are not alloy-specific — any HF-native CausalLM under
+> MindSpeed-MM needs them — but skipping them gives confusing crashes
+> partway into training, not at startup.
+
 ## What lives where
 
 | File | Role |
@@ -17,6 +26,7 @@ concrete worked example for a 340M qwen3-next-style dense model.
 | `examples/train/pretrain_alloy_qwen3_5_moe_mindspeed.yaml` | Yaml template — qwen3.5-MoE alloy (**GDN + MoE**) |
 | `examples/train/pretrain_alloy_qwen3_next_340m_mindspeed.yaml` | Yaml template — qwen3-next 340M alloy (**GDN, no MoE**) |
 | `examples/train/pretrain_alloy_qwen3_dense_mindspeed.yaml` | Yaml template — qwen3 dense alloy (**no GDN, no MoE**) |
+| `examples/train/mindspeed_mm_patches.md` | Required upstream patches on MindSpeed-MM (parquet dataloader; loss_func kwargs sink; defensive aux_loss access). Apply before training. |
 
 ## Quickstart: which template fits your model
 
@@ -111,8 +121,18 @@ training:
 ```
 
 If your `model_name_or_path` differs from `./hf_models/alloy_qwen3_next_340m`,
-update both occurrences (one in `data.dataset_param.preprocess_parameters.model_name_or_path`,
-one in `model.model_name_or_path`).
+update both occurrences and **make sure they are identical**:
+
+- `data.dataset_param.preprocess_parameters.model_name_or_path`
+- `model.model_name_or_path`
+
+Both must point at the **same directory** — the one produced by `package_config_for_hub`,
+containing `config.json` (with `model_type: alloy` + `auto_map`), `modeling_alloy.py`,
+and the tokenizer files. The data side calls `AutoConfig.from_pretrained(...)` on this
+path during `load_tokenizer`, so a path that doesn't contain a valid alloy `config.json`
+(or pointing one level too high / too low) will fail with
+`ValueError: Unrecognized model in <path>. Should have a model_type key in its config.json.`
+*before* training even starts.
 
 ### 4. Map MindSpeed-LLM bash hyperparameters → yaml
 
@@ -287,6 +307,19 @@ for name, _ in m.named_modules():
 ---
 
 ## Troubleshooting
+
+**`ValueError: Unrecognized model in <path>. Should have a model_type key in
+its config.json.`** — raised from `load_tokenizer` → `AutoConfig.from_pretrained`
+on the data side. Two common causes:
+
+1. `data.dataset_param.preprocess_parameters.model_name_or_path` and
+   `model.model_name_or_path` point at different directories. The data side
+   reads the alloy `config.json` from its own path; if it points one level
+   above (or below) the dir produced by `package_config_for_hub`, there's no
+   valid `config.json` there. Fix: make both yaml fields **identical**.
+2. The directory exists but its `config.json` lacks `model_type: alloy` /
+   `auto_map`. Re-run `package_config_for_hub` to regenerate, then verify
+   with `python -c "import json; print(json.load(open('<dir>/config.json')).get('model_type'))"`.
 
 **`KeyError: 'alloy' is not registered`** — the plugin import never ran.
 Check `training.plugin` includes `alloy.integrations.mindspeed_mm` and
