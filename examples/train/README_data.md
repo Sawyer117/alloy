@@ -115,7 +115,6 @@ data:
     dataset_type: huggingface
     attr:
       formatting: alpaca
-      pretrain: true
       prompt: text                       # ← column name in your jsonl
     basic_parameters:
       dataset_dir: /path/to/your/jsonl_folder    # purely informational
@@ -236,7 +235,6 @@ Common failure modes:
 |---|---|---|
 | `dataset_type` | which `data_register`-ed loader to use | `huggingface` (default) |
 | `attr.formatting` | data converter family | `alpaca` for pretrain text |
-| `attr.pretrain` | flag on alpaca converter | `true` for pretraining |
 | `attr.prompt` | column name holding the text | `text` (or whatever your file uses) |
 | `basic_parameters.dataset_dir` | media file root (NOT used for text) | doesn't matter; set to data folder for documentation |
 | `basic_parameters.dataset` | comma-separated file paths | absolute paths to your `.json` / `.jsonl` files |

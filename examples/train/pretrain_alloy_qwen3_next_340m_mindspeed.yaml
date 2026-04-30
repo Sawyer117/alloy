@@ -18,7 +18,7 @@
 # 并行策略
 parallel:
   tensor_parallel_size: 1
-  fully_shard_parallel_size: auto             # let FSDP pick from world size
+  fully_shard_parallel_size: 2                # FSDP shard size; must be a concrete int (auto is unsupported)
   fsdp_plan:
     apply_modules:
       - model.embed_tokens
@@ -46,12 +46,12 @@ data:
     dataset_type: huggingface
     attr:
       formatting: alpaca
-      pretrain: true
       prompt: text
     preprocess_parameters:
       model_name_or_path: ./hf_models/alloy_qwen3_next_340m   # tokenizer pulled from the same dir
       use_fast_tokenizer: true
       split_special_tokens: false
+      trust_remote_code: true                 # required for alloy custom modeling code
     basic_parameters:
       cutoff_len: 4096                        # = max_position_embeddings = SEQ_LENGTH
       template: default
@@ -62,14 +62,15 @@ data:
       dataset: train_part1.json               # set me
       cache_dir: ./cache_dir/
       overwrite_cache: false
-      preprocessing_batch_size: 1000
-      preprocessing_num_workers: 16
+      preprocessing_batch_size: 8000
+      preprocessing_num_workers: 32
       max_samples: null
       packing: true
+      stage: pretrain
 
   dataloader_param:
     pin_memory: true
-    shuffle: false
+    shuffle: true
     dataloader_mode: sampler
     drop_last: true
     sampler_type: BaseRandomBatchSampler
@@ -95,25 +96,25 @@ model:
 
   # ----- alloy runtime fast-path dispatch (forwarded onto transformer_config
   # by alloy.integrations.mindspeed_mm.overwrite_transformer_config) -----
-  _qwen3_5_gdn_implementation: torch          # torch | triton | flash (binder-registered)
+  _qwen3_5_gdn_implementation: triton         # torch | triton | flash (binder-registered)
                                               # flip to "flash" once binder verified on hardware
 
 # 训练配置
 training:
-  micro_batch_size: 6                         # = MBS in MindSpeed-LLM bash
-  gradient_accumulation_steps: 8              # = GBS / (MBS * world_size); set to GBS=48, MBS=6, WS=1 → 8
+  micro_batch_size: 8                         # = MBS in MindSpeed-LLM bash
+  gradient_accumulation_steps: 1              # = GBS / (MBS * world_size); tune to your cluster
   seed: 42
   lr: 2.0e-3                                  # = LR
   lr_min: 2.0e-4                              # = MIN_LR
   lr_decay_style: cosine
-  lr_warmup_ratio: 0.01                       # roughly 1024 / 101726 = 0.01
+  lr_warmup_ratio: 0.025                      # ~1000 / 38147 warmup steps
   weight_decay: 1.0e-1
-  train_iters: 101726                         # = TRAIN_ITERS
+  train_iters: 38147                          # = TRAIN_ITERS
   clip_grad: 1.0
   init_model_with_meta_device: true
   optimizer: adamw
   adam_fused: true
-  save_interval: 19235                        # = SAVE_ITERS (every ~12hrs)
+  save_interval: 19074                        # = SAVE_ITERS (every ~12hrs)
   save: ./intermediate_ckpt                   # = CKPT_SAVE_DIR
   use_deter_comp: false
   plugin:

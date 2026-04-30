@@ -36,7 +36,6 @@ data:
     dataset_type: huggingface
     attr:
       formatting: alpaca
-      pretrain: true
       prompt: text
     preprocess_parameters:
       model_name_or_path: ./hf_models/alloy_qwen3_dense
@@ -56,6 +55,7 @@ data:
       preprocessing_num_workers: 16
       max_samples: null
       packing: true
+      stage: pretrain
 
   dataloader_param:
     pin_memory: true
