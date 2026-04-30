@@ -422,13 +422,23 @@ class AlloyForCausalLM(AlloyPreTrainedModel, GenerationMixin):
         )
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        loss: Optional[torch.Tensor] = None
-        if labels is not None:
-            loss = self.loss_function(
-                logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
-            )
+        # Chunk-loss path (mindspeed-mm FSDP2 with enable_chunk_loss=true): the trainer
+        # monkey-patches lm_head.forward to take (hidden_states, loss_func) and return the
+        # loss directly, then sets enable_chunk_loss=True on the model. We must route to
+        # the new lm_head signature instead of computing logits + loss separately —
+        # otherwise the patched forward errors on the missing positional argument.
+        if getattr(self, "enable_chunk_loss", False):
+            logits = None
+            loss = self.lm_head(hidden_states[:, slice_indices, :], self.loss_function)
+        else:
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+            loss: Optional[torch.Tensor] = None
+            if labels is not None:
+                loss = self.loss_function(
+                    logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs
+                )
 
         return CausalLMOutputWithPast(
             loss=loss,
