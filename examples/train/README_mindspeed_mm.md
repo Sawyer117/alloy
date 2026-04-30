@@ -169,6 +169,25 @@ Then launch:
 bash my_qwen3_next_340m_launcher.sh localhost 1 0
 ```
 
+### 6. Post-training: convert DCP checkpoint → HF format
+
+mindspeed-mm saves checkpoints as torch DCP shards (`<save>/release/__*_*.distcp`),
+not HF safetensors. To get an `AutoModelForCausalLM.from_pretrained`-loadable dir,
+run:
+
+```bash
+python -m alloy.tools.dcp_to_hf \
+    --dcp-dir   ./intermediate_ckpt/release \
+    --hub-dir   ./hf_models/alloy_qwen3_next_340m \
+    --target    ./hf_models/alloy_qwen3_next_340m_trained
+```
+
+Loads the DCP shards in-process, repacks as standard sharded safetensors via
+`huggingface_hub.split_torch_state_dict_into_shards`, and copies config /
+modeling_alloy.py / tokenizer files from `--hub-dir`. Does not need a
+pre-existing safetensors index in `--hub-dir` (unlike mindspeed-mm's own
+`checkpoint/common/merge_dcp_to_hf.py`, which keys its sharding off one).
+
 ---
 
 ## General workflow (any architecture)
