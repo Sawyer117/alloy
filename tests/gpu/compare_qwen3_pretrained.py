@@ -24,9 +24,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Equivalence test contract: HF reference and alloy port should match on the
+# torch reference path. Pin alloy to torch by disabling the hf-npu-binder
+# auto-bridge BEFORE alloy is imported (no-op on a typical CUDA box without
+# binder installed; defensive in case the env happens to have it).
+os.environ["ALLOY_DISABLE_AUTO_BRIDGE"] = "1"
 
 import torch
 

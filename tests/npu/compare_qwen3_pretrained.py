@@ -40,9 +40,19 @@ specific reason to expect more drift.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Equivalence test contract: this script asserts HF reference and alloy port
+# produce matching forward logits + greedy generation. That comparison is
+# only meaningful when both sides run the same kernel family — both torch.
+# Pin alloy to the in-tree torch reference by disabling the hf-npu-binder
+# auto-bridge BEFORE alloy is imported (the env var is read in
+# alloy/__init__.py at module load). Backend variation (torch vs binder
+# triton/flash) is what tests/npu/run_compare_grid.sh is for, not this.
+os.environ["ALLOY_DISABLE_AUTO_BRIDGE"] = "1"
 
 import torch
 import torch_npu  # noqa: F401  registers the npu backend with torch

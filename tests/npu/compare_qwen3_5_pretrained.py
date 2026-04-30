@@ -50,9 +50,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Equivalence test contract: HF reference and alloy port should match on the
+# torch reference path. Pin alloy to torch by disabling the hf-npu-binder
+# auto-bridge BEFORE alloy is imported. Backend variation belongs in
+# tests/npu/run_compare_grid.sh, not here.
+os.environ["ALLOY_DISABLE_AUTO_BRIDGE"] = "1"
 
 import torch
 import torch_npu  # noqa: F401  registers the npu backend with torch
@@ -166,6 +173,10 @@ def phase_ours(
     print("[phase-2] Building AlloyForCausalLM from qwen3.5 text config")
     alloy_cfg = alloy_config_from_qwen3_5_text(hf_text_cfg)
     alloy_cfg._attn_implementation = "eager"
+    # Belt-and-suspenders: even if the auto-bridge somehow got loaded (env
+    # var override, prior import elsewhere), we still pin GDN to torch here
+    # so this script's HF-vs-alloy comparison stays apples-to-apples.
+    alloy_cfg._qwen3_5_gdn_implementation = "torch"
 
     with build_skeleton(dtype):
         ours = AlloyForCausalLM(alloy_cfg)
