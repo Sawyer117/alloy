@@ -28,9 +28,17 @@ Layer-type interpretation:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Diagnostic contract: drift at layer_N attributes a math difference to
+# alloy's port at layer N. That attribution only makes sense when both
+# sides run the same kernel family — both torch. Pin alloy to the in-tree
+# torch reference by disabling the hf-npu-binder auto-bridge BEFORE alloy
+# is imported (read in alloy/__init__.py at module load time).
+os.environ["ALLOY_DISABLE_AUTO_BRIDGE"] = "1"
 
 import torch
 import torch_npu  # noqa: F401  registers the npu backend with torch
@@ -141,6 +149,10 @@ def phase_ours(
     print("[phase-ours] Building AlloyForCausalLM from qwen3.5 text config")
     alloy_cfg = alloy_config_from_qwen3_5_text(hf_text_cfg)
     alloy_cfg._attn_implementation = "eager"
+    # Belt-and-suspenders: pin GDN to torch even if the auto-bridge somehow
+    # got loaded — drift attribution at layer_N only works if both sides
+    # run the same kernel family.
+    alloy_cfg._qwen3_5_gdn_implementation = "torch"
 
     with build_skeleton(dtype):
         ours = AlloyForCausalLM(alloy_cfg)

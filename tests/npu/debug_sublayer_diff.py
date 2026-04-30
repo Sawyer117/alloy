@@ -20,9 +20,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Diagnostic contract: drift at sub-module X inside layer 0 attributes a
+# math difference to alloy's port of X. That attribution only works when
+# both sides run the same kernel family — both torch. Pin alloy by
+# disabling the hf-npu-binder auto-bridge BEFORE alloy is imported.
+os.environ["ALLOY_DISABLE_AUTO_BRIDGE"] = "1"
 
 import torch
 import torch_npu  # noqa: F401
@@ -139,6 +146,8 @@ def phase_ours(pretrained, input_ids, num_layers, device, dtype, hf_text_cfg, or
     print("[phase-ours] Building AlloyForCausalLM")
     alloy_cfg = alloy_config_from_qwen3_5_text(hf_text_cfg)
     alloy_cfg._attn_implementation = "eager"
+    # Belt-and-suspenders: pin GDN to torch (matches the env var pin above).
+    alloy_cfg._qwen3_5_gdn_implementation = "torch"
 
     with build_skeleton(dtype):
         ours = AlloyForCausalLM(alloy_cfg)
