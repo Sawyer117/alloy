@@ -25,6 +25,7 @@ parallel:
       - model
       - model.layers.{*}
       - model.layers.{*}.linear_attn          # GDN mixer on linear_attention layers (0,1,2,4,5,6,...)
+      - model.layers.{*}.self_attn            # full-attention mixer on layers (3,7,11,15,19,23)
       - lm_head
     hook_modules:
       - model.layers.{0-23}                   # 24 layers
