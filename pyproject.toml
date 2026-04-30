@@ -22,7 +22,12 @@ keywords = [
 ]
 dependencies = [
     "torch>=2.0",
-    "transformers",
+    # alloy's qwen3.5 / qwen3-next ports track the upstream HF reference
+    # math op-for-op. transformers 5.5.x has different MLP/MoE bf16 cast
+    # behavior that breaks fp32 byte-equivalence with alloy's port; 5.7.0+
+    # is verified-aligned. Older releases may work for qwen3 dense (which
+    # has a smaller surface) but not Qwen3.5-MoE.
+    "transformers>=5.7.0",
     "safetensors",
 ]
 
