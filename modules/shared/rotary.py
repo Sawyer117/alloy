@@ -165,3 +165,32 @@ class RotaryEmbedding(nn.Module):
             idx = slice(offset, length, 3)
             freqs_t[..., idx] = freqs[dim, ..., idx]
         return freqs_t
+
+
+# --------------------------------------------------------------------------- #
+# Source-coupled aliases
+# --------------------------------------------------------------------------- #
+# The :class:`RotaryEmbedding` implementation above is genuinely parametric
+# — its body covers qwen3 (full rotary) and qwen3.5 / qwen3-next (partial +
+# interleaved mRoPE) under the same dispatch. The aliases below exist so
+# call sites can name the source family for self-documentation, mirroring
+# HF's per-model class convention. Future model families with structurally
+# different rotary (e.g. DeepSeek-V4's two-set ``rope_parameters`` for main
+# vs compressor RoPE) get their own non-aliased class.
+class Qwen3RotaryEmbedding(RotaryEmbedding):
+    """Qwen3 family rotary: full rotary, no partial / mrope.
+
+    Pure documentation subclass — body is the parent's parametric
+    implementation. Use this name at call sites in qwen3-flavoured
+    modules so the reader knows which family they're in.
+    """
+
+
+class Qwen35RotaryEmbedding(RotaryEmbedding):
+    """Qwen3.5 / Qwen3-Next family rotary: partial rotary (default 0.25)
+    + optional interleaved mRoPE.
+
+    Pure documentation subclass — body is the parent's parametric
+    implementation, which already dispatches on the relevant
+    ``rope_parameters`` flags.
+    """

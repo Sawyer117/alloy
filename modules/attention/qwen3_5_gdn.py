@@ -11,7 +11,7 @@ from ..registry import (
     register_implementation,
     register_mixer,
 )
-from ..shared.norm import RMSNormGated
+from ..shared.norm import Qwen35RMSNormGated
 
 
 def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -221,7 +221,7 @@ class Qwen35GatedDeltaNet(nn.Module):
         A = torch.empty(self.num_v_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A))
 
-        self.norm = RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+        self.norm = Qwen35RMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)

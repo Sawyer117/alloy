@@ -1,3 +1,25 @@
+"""Source-coupled RMSNorm variants.
+
+alloy follows HF's per-model class convention — even when two models'
+RMSNorms are mathematically equivalent, they get separate class names so
+state_dict provenance, debug prints, and source-of-truth references are
+unambiguous. The math is small enough that the duplication cost is
+trivial.
+
+Variants currently shipped:
+
+  - :class:`Qwen3RMSNorm` — ones-init, ``y = w * rms(x)``. Used by
+    Qwen3 / LLaMA-style models.
+  - :class:`Qwen35RMSNorm` — zero-init, unit-offset, ``y = (1+w) * rms(x)``.
+    Used by Qwen3.5 / Qwen3-Next / DeepSeek-V3.
+  - :class:`Qwen35RMSNormGated` — variant used inside Qwen3.5
+    GatedDeltaNet: applies an extra ``silu(gate)`` multiplication after
+    the standard ones-init RMS step.
+
+Backward compat: :func:`RMSNorm` is a factory function (was a class) that
+maps the legacy ``unit_offset=True/False`` kwarg to the matching named
+class. ``RMSNormGated`` is an alias for ``Qwen35RMSNormGated``.
+"""
 from __future__ import annotations
 
 import torch
@@ -5,54 +27,74 @@ import torch.nn.functional as F
 from torch import nn
 
 
-class RMSNorm(nn.Module):
-    """Parameterized RMSNorm covering both qwen3 and qwen3.5 styles.
+class Qwen3RMSNorm(nn.Module):
+    """Standard ones-init RMSNorm: ``y = w * rms(x)``.
 
-    - unit_offset=False (qwen3-style):  out = w * rms_norm(x),  weight init ones_
-    - unit_offset=True  (qwen3.5-style): out = (1 + w) * rms_norm(x), weight init zeros_
-
-    The two are algebraically equivalent under w' = 1 + w but differ in parameter
-    storage, init, and therefore checkpoint compatibility. Pick the style matching
-    the checkpoint you intend to load.
+    Used by Qwen3 dense models and any qwen3-flavoured port. ``weight`` is
+    initialised to ones so the layer starts as identity at the residual
+    scale of the model.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6, unit_offset: bool = False) -> None:
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.variance_epsilon = eps
-        self.unit_offset = unit_offset
-        init = torch.zeros(hidden_size) if unit_offset else torch.ones(hidden_size)
-        self.weight = nn.Parameter(init)
+        self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         x_fp32 = hidden_states.to(torch.float32)
         variance = x_fp32.pow(2).mean(-1, keepdim=True)
         x_normed = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
-        if self.unit_offset:
-            # qwen3.5 style: compute (1 + w) * x in fp32, cast back at the end.
-            output = x_normed * (1.0 + self.weight.float())
-            return output.to(input_dtype)
-        else:
-            # qwen3 / llama style: cast x back then multiply by w (w retains its dtype).
-            return self.weight * x_normed.to(input_dtype)
+        return self.weight * x_normed.to(input_dtype)
 
     def _alloy_init_weights(self, init_std: float) -> None:
-        # init_std is part of the alloy convention but unused here — RMSNorm
-        # initialises identity-equivalent: zeros for (1+w) style, ones for w style.
         del init_std
-        if self.unit_offset:
-            nn.init.zeros_(self.weight)
-        else:
-            nn.init.ones_(self.weight)
+        nn.init.ones_(self.weight)
 
     def extra_repr(self) -> str:
-        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}, unit_offset={self.unit_offset}"
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class RMSNormGated(nn.Module):
-    """Gated RMSNorm used by Qwen35GatedDeltaNet (port of Qwen3_5MoeRMSNormGated).
+class Qwen35RMSNorm(nn.Module):
+    """Unit-offset zero-init RMSNorm: ``y = (1 + w) * rms(x)``.
 
-    Normalizes `hidden_states` then multiplies by SiLU(gate).
+    Used by Qwen3.5 / Qwen3-Next / DeepSeek-V3. ``weight`` is initialised
+    to zeros so the ``(1 + w)`` factor starts as identity, which lets the
+    surrounding layer initialise stably without an extra scale parameter.
+    The ``(1 + w)`` multiplication is computed in fp32 to dodge bf16 noise
+    on small weight magnitudes; the cast back to ``input_dtype`` happens
+    at the end.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        x_fp32 = hidden_states.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        x_normed = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
+        output = x_normed * (1.0 + self.weight.float())
+        return output.to(input_dtype)
+
+    def _alloy_init_weights(self, init_std: float) -> None:
+        del init_std
+        nn.init.zeros_(self.weight)
+
+    def extra_repr(self) -> str:
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}, unit_offset=True"
+
+
+class Qwen35RMSNormGated(nn.Module):
+    """Gated RMSNorm used by Qwen3.5 GatedDeltaNet (port of
+    ``Qwen3_5MoeRMSNormGated``).
+
+    Normalises ``hidden_states`` with a ones-init weight, multiplies by
+    ``silu(gate)`` to gate the output. Despite the qwen3.5 family name,
+    this variant uses ones-init (not unit-offset zero-init) — that's how
+    the upstream class is defined.
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -72,3 +114,24 @@ class RMSNormGated(nn.Module):
     def _alloy_init_weights(self, init_std: float) -> None:
         del init_std
         nn.init.ones_(self.weight)
+
+
+# --------------------------------------------------------------------------- #
+# Backward-compat shims
+# --------------------------------------------------------------------------- #
+# Earlier alloy code constructed RMSNorm with a parametric ``unit_offset``
+# kwarg. Keep those callers working: ``RMSNorm`` is now a factory that
+# returns the matching named class. New code should construct
+# ``Qwen3RMSNorm`` / ``Qwen35RMSNorm`` directly. The factory returns an
+# already-constructed module so the call site doesn't change.
+def RMSNorm(hidden_size: int, eps: float = 1e-6, unit_offset: bool = False) -> nn.Module:
+    """Deprecated factory: prefer constructing :class:`Qwen3RMSNorm` /
+    :class:`Qwen35RMSNorm` directly. Kept so existing callers keep working
+    without churn.
+    """
+    cls = Qwen35RMSNorm if unit_offset else Qwen3RMSNorm
+    return cls(hidden_size, eps)
+
+
+# Old name; new code should use Qwen35RMSNormGated directly.
+RMSNormGated = Qwen35RMSNormGated
