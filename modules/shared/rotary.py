@@ -194,3 +194,152 @@ class Qwen35RotaryEmbedding(RotaryEmbedding):
     implementation, which already dispatches on the relevant
     ``rope_parameters`` flags.
     """
+
+
+# --------------------------------------------------------------------------- #
+# Interleaved RoPE (DeepSeek-V4 family)
+# --------------------------------------------------------------------------- #
+# The qwen3 / qwen3.5 path above uses *paired* RoPE: the head dim is split
+# in half, the two halves are rotated against each other via
+# `cat([first_half, second_half])` and `rotate_half` returns
+# `cat([-second_half, first_half])`. DeepSeek-V4 instead uses *interleaved*
+# RoPE: consecutive channel pairs (0,1), (2,3), (4,5), ... are rotated
+# together. This needs a different `rotate_half` body and a different
+# `apply_rotary_pos_emb` (single-tensor signature; cos/sin come in
+# half-size and are expanded with `repeat_interleave(2)`).
+#
+# Helpers ported from
+# ``references/dsv4/modeling_deepseek_v4.py:335-359``
+# (rotate_half + apply_rotary_pos_emb).
+
+
+def rotate_half_interleaved(x: torch.Tensor) -> torch.Tensor:
+    """Rotate consecutive channel pairs (DSV4 interleaved RoPE).
+
+    Pairs ``(x_0, x_1), (x_2, x_3), ...`` are mapped to
+    ``(-x_1, x_0), (-x_3, x_2), ...``. Used by
+    :func:`apply_rotary_pos_emb_interleaved`.
+    """
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def apply_rotary_pos_emb_interleaved(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> torch.Tensor:
+    """Apply interleaved RoPE to the trailing rope slice of ``x``.
+
+    ``cos`` / ``sin`` arrive at half-size (one entry per interleaved pair,
+    from :class:`DeepseekV4RotaryEmbedding`); we expand to the full rope
+    dim with ``repeat_interleave(2)``, then rotate the last
+    ``2 * cos.shape[-1]`` channels of ``x`` with the standard
+    ``x*cos + rotate_half(x)*sin`` formula in fp32. The leading ``nope``
+    channels (head layout is ``[nope | rope]``) pass through unchanged.
+
+    Single-tensor signature (vs the qwen3 helper's ``(q, k)`` pair) —
+    DSV4 attention applies rotary separately to query and key.
+    """
+    cos = cos.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
+    sin = sin.repeat_interleave(2, dim=-1).unsqueeze(unsqueeze_dim)
+    rope_dim = cos.shape[-1]
+    nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
+    rotated = ((rope.float() * cos) + (rotate_half_interleaved(rope).float() * sin)).to(x.dtype)
+    return torch.cat([nope, rotated], dim=-1)
+
+
+class DeepseekV4RotaryEmbedding(nn.Module):
+    """DeepSeek-V4 rotary embedding (interleaved, multi-rope-type).
+
+    DSV4 carries TWO sets of rope parameters in ``config.rope_parameters``,
+    keyed by rope-type label rather than architecture layer type::
+
+        config.rope_parameters = {
+            "main":     {"rope_type": "default", "rope_theta": ..., "partial_rotary_factor": ...},
+            "compress": {"rope_type": "default", "rope_theta": ..., ...},
+        }
+
+    The forward takes an extra ``layer_type`` argument (``"main"`` or
+    ``"compress"``) that picks which inv_freq buffer to use. ``"main"`` is
+    used by the standard attention path; ``"compress"`` is used inside
+    HCA / CSA compressors where the RoPE base is different (typically a
+    larger ``rope_theta`` to handle the sparse/compressed positions).
+
+    No ``cat([freqs, freqs])`` duplication — the half-size cos/sin
+    returned here is expanded by :func:`apply_rotary_pos_emb_interleaved`
+    via ``repeat_interleave(2)``.
+
+    Ported from ``references/dsv4/modeling_deepseek_v4.py:75-168``
+    (DeepseekV4RotaryEmbedding).
+    """
+
+    inv_freq: torch.Tensor
+
+    def __init__(self, config, device=None) -> None:
+        super().__init__()
+        self.config = config
+        self.max_seq_len_cached = getattr(config, "max_position_embeddings", 0)
+        self.original_max_seq_len = self.max_seq_len_cached
+
+        rope_params = config.rope_parameters or {}
+        # Only sub-dicts are real per-rope-type entries — the top-level
+        # ``rope_type`` key (left over by ``convert_rope_params_to_dict``
+        # in some configs) is a flat-shape leftover, not a layer.
+        self.layer_types = [k for k, v in rope_params.items() if isinstance(v, dict)]
+        self.rope_type: dict[str, str] = {}
+        for layer_type in self.layer_types:
+            sub_params = rope_params[layer_type]
+            self.rope_type[layer_type] = sub_params.get("rope_type", "default")
+            rope_init_fn: Callable = self._compute_default_rope_parameters
+            if self.rope_type[layer_type] != "default":
+                rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type[layer_type]]
+            inv_freq, attention_scaling = rope_init_fn(config, layer_type=layer_type, device=device)
+            self.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
+            self.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
+            setattr(self, f"{layer_type}_attention_scaling", attention_scaling)
+
+    @staticmethod
+    def _compute_default_rope_parameters(
+        config,
+        device=None,
+        seq_len=None,
+        layer_type: str | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        """Default RoPE per-layer-type: read base + partial factor from
+        ``config.rope_parameters[layer_type]``, build inv_freq."""
+        del seq_len
+        sub_params = config.rope_parameters[layer_type]
+        base = sub_params["rope_theta"]
+        partial_rotary_factor = float(sub_params.get("partial_rotary_factor", 1.0))
+        head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial_rotary_factor)
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, 1.0
+
+    @torch.no_grad()
+    @dynamic_rope_update
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor,
+        layer_type: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if layer_type is None:
+            raise ValueError(
+                "DeepseekV4RotaryEmbedding.forward requires layer_type "
+                f"({list(self.layer_types)!r}); pass 'main' or 'compress'."
+            )
+        inv_freq = getattr(self, f"{layer_type}_inv_freq")
+        attention_scaling = getattr(self, f"{layer_type}_attention_scaling")
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            cos = freqs.cos() * attention_scaling
+            sin = freqs.sin() * attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)

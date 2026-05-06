@@ -116,6 +116,56 @@ class Qwen35RMSNormGated(nn.Module):
         nn.init.ones_(self.weight)
 
 
+class DeepseekV4RMSNorm(nn.Module):
+    """DeepSeek-V4 standard RMSNorm.
+
+    Mathematically equivalent to :class:`Qwen3RMSNorm` (ones-init, ``y = w *
+    rms(x)``) — kept as a separate class for source provenance, matching
+    HF's per-model class convention. Ported from
+    ``references/dsv4/modeling_deepseek_v4.py:46`` (DeepseekV4RMSNorm).
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        x_fp32 = hidden_states.to(torch.float32)
+        variance = x_fp32.pow(2).mean(-1, keepdim=True)
+        x_normed = x_fp32 * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * x_normed.to(input_dtype)
+
+    def _alloy_init_weights(self, init_std: float) -> None:
+        del init_std
+        nn.init.ones_(self.weight)
+
+    def extra_repr(self) -> str:
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class DeepseekV4UnweightedRMSNorm(nn.Module):
+    """DeepSeek-V4 RMSNorm without learnable scale.
+
+    Pure normalization (``y = x / sqrt(mean(x²) + eps)``); used inside DSV4
+    attention sites where the post-norm scale is folded into a downstream
+    projection. No parameters → no init-style decisions to make. Ported
+    from ``references/dsv4/modeling_deepseek_v4.py:66``
+    (DeepseekV4UnweightedRMSNorm).
+    """
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.eps).to(x.dtype)
+
+    def extra_repr(self) -> str:
+        return f"eps={self.eps}"
+
+
 # --------------------------------------------------------------------------- #
 # Backward-compat shims
 # --------------------------------------------------------------------------- #
