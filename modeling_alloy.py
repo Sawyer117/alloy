@@ -14,7 +14,50 @@ from transformers.modeling_utils import PreTrainedModel
 
 from .configuration_alloy import AlloyConfig
 from .modules.registry import get_ffn, get_mixer
-from .modules.shared.rotary import RotaryEmbedding
+from .modules.shared.rotary import DeepseekV4RotaryEmbedding, RotaryEmbedding
+
+
+def _make_rotary(config: AlloyConfig) -> nn.Module:
+    """Pick the rotary class that matches ``config.rope_parameters`` shape.
+
+    qwen3 / qwen3.5 ship a flat ``rope_parameters`` dict
+    (``{"rope_type": "default", "rope_theta": ...}``); the parametric
+    :class:`RotaryEmbedding` handles those.
+
+    DeepSeek-V4 ships a dict-of-dicts
+    (``{"main": {...}, "compress": {...}}``) carrying TWO sets of rope
+    parameters (different ``rope_theta`` for the standard attention path
+    vs the HCA/CSA compressors). It needs
+    :class:`DeepseekV4RotaryEmbedding`, which maintains a separate
+    ``inv_freq`` buffer per rope-type key and takes a ``layer_type``
+    kwarg at forward.
+
+    Auto-detected from shape so we don't tie the dispatch to family
+    naming — any future model with multi-rope-type config gets the
+    right class automatically.
+    """
+    rope_params = config.rope_parameters or {}
+    is_dict_of_dicts = any(isinstance(v, dict) for v in rope_params.values())
+    if is_dict_of_dicts:
+        return DeepseekV4RotaryEmbedding(config)
+    return RotaryEmbedding(config=config)
+
+
+def _call_rotary(
+    rotary_emb: nn.Module,
+    hidden_states: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Call the model-level rotary, passing ``layer_type="main"`` when the
+    rotary class needs it (DSV4 family).
+
+    Detected via the ``layer_types`` instance attribute that
+    :class:`DeepseekV4RotaryEmbedding` sets in __init__ and the
+    parametric :class:`RotaryEmbedding` doesn't have.
+    """
+    if hasattr(rotary_emb, "layer_types"):
+        return rotary_emb(hidden_states, position_ids, layer_type="main")
+    return rotary_emb(hidden_states, position_ids)
 # RMSNorm is the only non-stdlib module modeling_alloy *constructs directly*
 # (input_layernorm / post_attention_layernorm / final norm). All registered
 # mixer / FFN classes are looked up by string via get_mixer / get_ffn at
@@ -480,7 +523,7 @@ class AlloyModel(AlloyPreTrainedModel):
         self.norm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
         )
-        self.rotary_emb = RotaryEmbedding(config=config)
+        self.rotary_emb = _make_rotary(config)
         # MHC head: collapses multi-stream back to single-stream just before
         # the final norm. Only built when use_mhc=True so non-MHC models
         # don't carry the parameter overhead.
@@ -575,7 +618,7 @@ class AlloyModel(AlloyPreTrainedModel):
                 mask_for_kind["linear"] = _update_linear_attn_mask(attention_mask, past_key_values)
 
         hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = _call_rotary(self.rotary_emb, hidden_states, position_ids)
 
         # MHC mode: expand the embedding output into hc_mult parallel
         # residual streams. AlloyMhcDecoderLayer takes [B, S, hc_mult, D]
