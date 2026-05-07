@@ -22,9 +22,31 @@ HF_LAYER_TYPE_TO_ALLOY: dict[str, str] = {
     "full_attention": "qwen3_attention",
     "sliding_attention": "qwen3_attention_sliding",
     "linear_attention": "qwen3_5_gdn",
+    # DSV4 layer types: HF canonical → alloy source-coupled. Note this map
+    # is used by ``hf_layer_types_to_alloy`` when *reading* an external HF
+    # config (e.g. test scripts that load reference DSV4 weights). The
+    # reverse direction (alloy → HF) is many-to-one (multiple alloy mixer
+    # flavors can share the same HF cache layer type), so we maintain
+    # ``ALLOY_LAYER_TYPE_TO_HF`` separately below rather than auto-deriving.
+    "heavily_compressed_attention": "dsv4_hca_attention",
+    "compressed_sparse_attention": "dsv4_csa_attention",
 }
 
-ALLOY_LAYER_TYPE_TO_HF: dict[str, str] = {v: k for k, v in HF_LAYER_TYPE_TO_ALLOY.items()}
+# Many-to-one in the alloy → HF direction: e.g. ``qwen3_attention_sliding``
+# and ``dsv4_sliding_attention`` are different alloy mixer types (different
+# attention class implementations) but share the same HF cache layer
+# (``DynamicSlidingWindowLayer``), so both translate to ``"sliding_attention"``.
+# Written explicitly so the ambiguity is visible.
+ALLOY_LAYER_TYPE_TO_HF: dict[str, str] = {
+    # qwen3 family
+    "qwen3_attention": "full_attention",
+    "qwen3_attention_sliding": "sliding_attention",
+    "qwen3_5_gdn": "linear_attention",
+    # DSV4 family
+    "dsv4_sliding_attention": "sliding_attention",
+    "dsv4_hca_attention": "heavily_compressed_attention",
+    "dsv4_csa_attention": "compressed_sparse_attention",
+}
 
 
 def hf_layer_types_to_alloy(hf_layer_types) -> list[str]:
@@ -135,6 +157,12 @@ class AlloyConfig(PretrainedConfig):
             "moe_intermediate_size", "shared_expert_intermediate_size",
             "router_aux_loss_coef",
         ),
+        # DeepSeek-V4 attention (LoRA-Q + grouped output proj)
+        ("q_lora_rank", "o_groups", "o_lora_rank"),
+        # DeepSeek-V4 CSA Lightning Indexer
+        ("index_n_heads", "index_head_dim", "index_topk"),
+        # DeepSeek-V4 compression rates per layer type (HCA / CSA)
+        ("compress_rates",),
     )
 
     def __init__(
@@ -180,6 +208,18 @@ class AlloyConfig(PretrainedConfig):
         moe_intermediate_size: int = 512,
         shared_expert_intermediate_size: int = 512,
         router_aux_loss_coef: float = 0.001,
+        # DeepSeek-V4 attention (LoRA-Q + grouped output proj + sinks)
+        q_lora_rank: int = 1024,
+        o_groups: int = 8,
+        o_lora_rank: int = 1024,
+        # DeepSeek-V4 CSA Lightning Indexer
+        index_n_heads: int = 64,
+        index_head_dim: int = 128,
+        index_topk: int = 512,
+        # DeepSeek-V4 compression rates per layer type. Defaults match
+        # the DSV4Config defaults; only consumed by HCA/CSA layers and the
+        # corresponding cache classes.
+        compress_rates: dict | None = None,
         **kwargs,
     ) -> None:
         self.vocab_size = vocab_size
@@ -213,6 +253,19 @@ class AlloyConfig(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.router_aux_loss_coef = router_aux_loss_coef
+
+        # DeepSeek-V4 specific
+        self.q_lora_rank = q_lora_rank
+        self.o_groups = o_groups
+        self.o_lora_rank = o_lora_rank
+        self.index_n_heads = index_n_heads
+        self.index_head_dim = index_head_dim
+        self.index_topk = index_topk
+        self.compress_rates = (
+            compress_rates
+            if compress_rates is not None
+            else {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
+        )
 
         if rope_parameters is None:
             rope_parameters = {"rope_type": "default", "rope_theta": 10000.0}
