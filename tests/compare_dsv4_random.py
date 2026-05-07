@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # --------------------------------------------------------------------------- #
 
 
-def _build_configs():
+def _build_configs(attn_implementation: str = "eager"):
     """Return (hf_config, alloy_config) for the same small DSV4 architecture.
 
     Small enough for fast random-weight tests (~few seconds for forward
@@ -116,14 +116,14 @@ def _build_configs():
     hf_cfg = DeepseekV4Config(
         layer_types=layer_types_hf,
         mlp_layer_types=mlp_types_hf,
-        attn_implementation="eager",
+        attn_implementation=attn_implementation,
         **common,
     )
     alloy_cfg = AlloyConfig(
         layer_types=layer_types_alloy,
         ffn_types=ffn_types_alloy,
         use_mhc=True,
-        attn_implementation="eager",
+        attn_implementation=attn_implementation,
         **common,
     )
     return hf_cfg, alloy_cfg
@@ -145,12 +145,22 @@ def main() -> int:
                         help="cpu / cuda / npu — random-weight test is hardware-agnostic.")
     parser.add_argument("--atol", type=float, default=0.0,
                         help="fp32 PASS tolerance. Default 0.0 = byte-exact required.")
+    parser.add_argument(
+        "--attn-impl", default="eager", choices=["eager", "sdpa", "flash_attention_2"],
+        help="Attention backend forced on both sides. Default 'eager' is the "
+             "byte-exact reference path (alloy and HF have identical eager "
+             "bodies that honour DSV4's per-head sinks). 'sdpa' is the "
+             "production-default backend on most envs but currently does NOT "
+             "consume the s_aux=sinks kwarg, so this comparison will *fail* "
+             "with sdpa even when the alloy port is algorithmically correct — "
+             "exactly the production caveat to be aware of.",
+    )
     args = parser.parse_args()
 
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[args.dtype]
     device = torch.device(args.device)
 
-    hf_cfg, alloy_cfg = _build_configs()
+    hf_cfg, alloy_cfg = _build_configs(attn_implementation=args.attn_impl)
 
     # ----- 1. Build HF reference -----
     from transformers.models.deepseek_v4 import DeepseekV4ForCausalLM
