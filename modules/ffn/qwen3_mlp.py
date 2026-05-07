@@ -26,5 +26,7 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        # **kwargs absorbs any layer-level routing context (e.g. input_ids
+        # threaded through for DSV4 hash-moe siblings); ignored here.
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))

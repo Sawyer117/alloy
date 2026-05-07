@@ -122,6 +122,7 @@ class AlloyDecoderLayer(nn.Module):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        input_ids: torch.LongTensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -141,7 +142,11 @@ class AlloyDecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        ffn_out = self.mlp(hidden_states)
+        # input_ids is forwarded uniformly; FFN classes that don't need it
+        # (Qwen3MLP, Qwen35SparseMoE) absorb it via **kwargs. Hash-routed
+        # MoE variants (DSV4 dsv4_hash_moe) read it to compute the
+        # tid2eid expert lookup.
+        ffn_out = self.mlp(hidden_states, input_ids=input_ids)
         if isinstance(ffn_out, tuple):
             ffn_out = ffn_out[0]
         hidden_states = residual + ffn_out
@@ -379,6 +384,10 @@ class AlloyModel(AlloyPreTrainedModel):
                 past_key_values=past_key_values,
                 position_embeddings=position_embeddings,
                 use_cache=use_cache,
+                # input_ids is needed by hash-routed MoE FFNs (DSV4
+                # dsv4_hash_moe). Other FFN variants ignore it via
+                # **kwargs at the FFN forward.
+                input_ids=input_ids,
             )
 
         hidden_states = self.norm(hidden_states)

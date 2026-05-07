@@ -164,7 +164,9 @@ class Qwen35SparseMoE(nn.Module):
         self.shared_expert = _SharedMLP(config)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+        # **kwargs absorbs any layer-level routing context (e.g. input_ids
+        # threaded through for DSV4 hash-moe siblings); ignored here.
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
