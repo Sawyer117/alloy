@@ -69,38 +69,46 @@ def _attach_hooks_full(model, num_layers: int):
 
 def _attach_hooks_layer0_sub(model, side_label: str):
     """Hook every interesting sub-point inside layer 0 for fine-grained
-    drill-down. Sub-modules are named the same on both sides
-    (input_layernorm, post_attention_layernorm, mlp; mixer attribute is
-    self_attn for DSV4 attention layers, attn_hc / ffn_hc for HC blocks).
+    drill-down. Sub-modules are named the same on both sides.
+
+    Coarse points (block-level):
+      input_layernorm, self_attn, post_attention_layernorm, mlp
+      attn_hc, ffn_hc (MHC sites)
+
+    Fine points inside self_attn (run when the coarse self_attn DIVERGES,
+    to localise which op inside DSV4 attention introduced drift):
+      q_a_proj, q_a_norm, q_b_proj, q_b_norm
+      kv_proj, kv_norm
+      compressor                — HCA / CSA / None
+      o_a_proj, o_b_proj
     """
     store: dict[str, torch.Tensor] = {}
     handles: list = []
     layer0 = model.model.layers[0]
 
-    if hasattr(layer0, "input_layernorm"):
-        handles.append(layer0.input_layernorm.register_forward_hook(
-            _capture_hook(store, f"L0/{side_label}/input_layernorm")
-        ))
+    # ----- block-level -----
+    coarse = ["input_layernorm", "self_attn", "post_attention_layernorm",
+              "mlp", "attn_hc", "ffn_hc"]
+    for name in coarse:
+        if hasattr(layer0, name):
+            handles.append(getattr(layer0, name).register_forward_hook(
+                _capture_hook(store, f"L0/{side_label}/{name}")
+            ))
+
+    # ----- inside self_attn -----
     if hasattr(layer0, "self_attn"):
-        handles.append(layer0.self_attn.register_forward_hook(
-            _capture_hook(store, f"L0/{side_label}/self_attn")
-        ))
-    if hasattr(layer0, "post_attention_layernorm"):
-        handles.append(layer0.post_attention_layernorm.register_forward_hook(
-            _capture_hook(store, f"L0/{side_label}/post_attention_layernorm")
-        ))
-    if hasattr(layer0, "mlp"):
-        handles.append(layer0.mlp.register_forward_hook(
-            _capture_hook(store, f"L0/{side_label}/mlp")
-        ))
-    if hasattr(layer0, "attn_hc"):
-        handles.append(layer0.attn_hc.register_forward_hook(
-            _capture_hook(store, f"L0/{side_label}/attn_hc")
-        ))
-    if hasattr(layer0, "ffn_hc"):
-        handles.append(layer0.ffn_hc.register_forward_hook(
-            _capture_hook(store, f"L0/{side_label}/ffn_hc")
-        ))
+        attn = layer0.self_attn
+        attn_subs = ["q_a_proj", "q_a_norm", "q_b_proj", "q_b_norm",
+                     "kv_proj", "kv_norm", "o_a_proj", "o_b_proj"]
+        for name in attn_subs:
+            if hasattr(attn, name):
+                handles.append(getattr(attn, name).register_forward_hook(
+                    _capture_hook(store, f"L0/{side_label}/self_attn.{name}")
+                ))
+        if hasattr(attn, "compressor") and attn.compressor is not None:
+            handles.append(attn.compressor.register_forward_hook(
+                _capture_hook(store, f"L0/{side_label}/self_attn.compressor")
+            ))
     return store, handles
 
 
@@ -213,7 +221,29 @@ def main() -> int:
     print("=" * 96)
     print("Layer-0 sub-points (fine-grained drill-down)")
     print("-" * 96)
-    sub_keys = sorted(set(k.split("/", 2)[-1] for k in hf_l0))
+    # Explicit forward-order grouping (block-level → attention internals
+    # → MLP / HC). Anything captured but not listed here gets appended.
+    ordered_subs = [
+        "input_layernorm",
+        "attn_hc",
+        "self_attn",                     # coarse — flagged DIVERGES means dig below
+        "self_attn.q_a_proj",
+        "self_attn.q_a_norm",
+        "self_attn.q_b_proj",
+        "self_attn.q_b_norm",
+        "self_attn.kv_proj",
+        "self_attn.kv_norm",
+        "self_attn.compressor",
+        "self_attn.o_a_proj",
+        "self_attn.o_b_proj",
+        "post_attention_layernorm",
+        "ffn_hc",
+        "mlp",
+    ]
+    captured = set(k.split("/", 2)[-1] for k in hf_l0)
+    leftovers = sorted(captured - set(ordered_subs))
+    sub_keys = [s for s in ordered_subs if s in captured] + leftovers
+
     print(f"{'sub-point':<32} {'shape':<28} {'max_abs':>12} {'mean_abs':>12}  flag")
     print("-" * 96)
     for sub in sub_keys:
