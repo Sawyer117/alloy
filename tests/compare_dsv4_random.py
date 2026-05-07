@@ -106,15 +106,24 @@ def _build_configs():
     mlp_types_hf      = ["hash_moe", "moe", "moe", "moe"]
     ffn_types_alloy   = ["dsv4_hash_moe", "dsv4_moe", "dsv4_moe", "dsv4_moe"]
 
+    # Force eager attention on both sides so the byte-equivalence test
+    # exercises the same kernel family (alloy's _eager_attention_with_sinks
+    # vs HF's eager_attention_forward, which have identical bodies).
+    # Without this, ``_attn_implementation`` defaults to whatever HF
+    # detects per-side at construction time — if alloy lands on sdpa and
+    # HF lands on eager (or vice versa), sinks handling diverges silently
+    # and the equivalence test fails by 1e-1 even with identical weights.
     hf_cfg = DeepseekV4Config(
         layer_types=layer_types_hf,
         mlp_layer_types=mlp_types_hf,
+        attn_implementation="eager",
         **common,
     )
     alloy_cfg = AlloyConfig(
         layer_types=layer_types_alloy,
         ffn_types=ffn_types_alloy,
         use_mhc=True,
+        attn_implementation="eager",
         **common,
     )
     return hf_cfg, alloy_cfg
@@ -155,6 +164,11 @@ def main() -> int:
 
     print("[2/4] Building alloy AlloyForCausalLM (use_mhc=True) ...", flush=True)
     alloy_model = AlloyForCausalLM(alloy_cfg).to(device=device, dtype=dtype).eval()
+
+    # Diagnostic: confirm both sides resolved to the same attention backend.
+    # If these differ, equivalence is impossible regardless of state_dict copy.
+    print(f"      HF    _attn_implementation: {hf_model.config._attn_implementation!r}")
+    print(f"      alloy _attn_implementation: {alloy_model.config._attn_implementation!r}")
 
     print("[3/4] Loading HF state_dict into alloy (strict=True) ...", flush=True)
     sd = hf_model.state_dict()
