@@ -151,11 +151,14 @@ class AlloyConfig(PretrainedConfig):
         ),
         # MLP (qwen3_mlp)
         ("intermediate_size",),
-        # MoE (qwen3_5_moe)
+        # MoE (qwen3_5_moe / dsv4_moe / dsv4_hash_moe)
         (
             "num_experts", "num_experts_per_tok",
             "moe_intermediate_size", "shared_expert_intermediate_size",
             "router_aux_loss_coef",
+            # DSV4 MoE extras
+            "mlp_bias", "swiglu_limit",
+            "scoring_func", "routed_scaling_factor",
         ),
         # DeepSeek-V4 attention (LoRA-Q + grouped output proj)
         ("q_lora_rank", "o_groups", "o_lora_rank"),
@@ -208,6 +211,12 @@ class AlloyConfig(PretrainedConfig):
         moe_intermediate_size: int = 512,
         shared_expert_intermediate_size: int = 512,
         router_aux_loss_coef: float = 0.001,
+        # MoE / FFN extras (DeepSeek-V4 family; harmless defaults for
+        # other ports that ignore them):
+        mlp_bias: bool = False,                  # gate/up/down_proj bias on dense MLP
+        swiglu_limit: float = 10.0,              # clamp inside _apply_gate
+        scoring_func: str = "sqrtsoftplus",      # router scoring activation (ACT2FN key)
+        routed_scaling_factor: float = 1.5,      # multiplier on router weights
         # DeepSeek-V4 attention (LoRA-Q + grouped output proj + sinks)
         q_lora_rank: int = 1024,
         o_groups: int = 8,
@@ -253,6 +262,10 @@ class AlloyConfig(PretrainedConfig):
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size
         self.router_aux_loss_coef = router_aux_loss_coef
+        self.mlp_bias = mlp_bias
+        self.swiglu_limit = swiglu_limit
+        self.scoring_func = scoring_func
+        self.routed_scaling_factor = routed_scaling_factor
 
         # DeepSeek-V4 specific
         self.q_lora_rank = q_lora_rank
