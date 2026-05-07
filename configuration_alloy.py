@@ -153,7 +153,12 @@ class AlloyConfig(PretrainedConfig):
         ("intermediate_size",),
         # MoE (qwen3_5_moe / dsv4_moe / dsv4_hash_moe)
         (
-            "num_experts", "num_experts_per_tok",
+            # qwen3.5 family expert count
+            "num_experts",
+            # DSV4 family expert count (source-coupled, kept distinct
+            # from num_experts on purpose)
+            "n_routed_experts",
+            "num_experts_per_tok",
             "moe_intermediate_size", "shared_expert_intermediate_size",
             "router_aux_loss_coef",
             # DSV4 MoE extras
@@ -207,8 +212,15 @@ class AlloyConfig(PretrainedConfig):
         linear_conv_kernel_dim: int = 4,
         # dense FFN (MLP)
         intermediate_size: int = 8192,
-        # MoE
+        # MoE — qwen3.5 family uses ``num_experts`` (matches Qwen3_5MoeConfig);
+        # DeepSeek-V4 family uses ``n_routed_experts`` (matches DeepseekV4Config,
+        # which attribute_maps it to ``num_local_experts``). Source-coupled
+        # naming on purpose: alloy stays a faithful composer of HF reference
+        # ports, doesn't rename their config fields. A user who mixes both
+        # families in one model provides both fields (with potentially
+        # different values).
         num_experts: int = 0,
+        n_routed_experts: int = 256,
         num_experts_per_tok: int = 0,
         moe_intermediate_size: int = 512,
         shared_expert_intermediate_size: int = 512,
@@ -268,6 +280,7 @@ class AlloyConfig(PretrainedConfig):
         self.intermediate_size = intermediate_size
 
         self.num_experts = num_experts
+        self.n_routed_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.moe_intermediate_size = moe_intermediate_size
         self.shared_expert_intermediate_size = shared_expert_intermediate_size

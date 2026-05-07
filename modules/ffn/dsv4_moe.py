@@ -16,9 +16,12 @@ either :class:`DeepseekV4TopKRouter` or :class:`DeepseekV4HashRouter` as
 
 Source provenance: ported from
 ``references/dsv4/modeling_deepseek_v4.py`` lines 909-1035. Class
-structure preserved; alloy uses ``config.num_experts`` (alloy
-convention) rather than HF DSV4's ``config.num_local_experts`` —
-both name the same thing.
+structure preserved including config field names: routers and experts
+read ``config.n_routed_experts`` (DSV4's source-coupled name; HF
+attribute_map'd to ``num_local_experts``), NOT alloy's qwen3.5-derived
+``num_experts``. Each port stays faithful to its source's config
+interface — alloy doesn't pretend two families' "expert count"
+fields are the same field.
 """
 from __future__ import annotations
 
@@ -92,7 +95,7 @@ class _Experts(nn.Module):
 
     def __init__(self, config) -> None:
         super().__init__()
-        self.num_experts = config.num_experts
+        self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size
         self.gate_up_proj = nn.Parameter(
@@ -170,7 +173,7 @@ class DeepseekV4TopKRouter(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
+        self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
         score_fn_name = getattr(config, "scoring_func", "sqrtsoftplus")
@@ -214,7 +217,7 @@ class DeepseekV4HashRouter(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
         self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_experts
+        self.num_experts = config.n_routed_experts
         self.hidden_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
         score_fn_name = getattr(config, "scoring_func", "sqrtsoftplus")

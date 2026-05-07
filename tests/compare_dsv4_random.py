@@ -69,8 +69,11 @@ def _build_configs():
         hc_mult=2,
         hc_sinkhorn_iters=2,
         hc_eps=1e-6,
-        # MoE
-        num_experts=4,
+        # MoE — use DSV4's source-coupled name (``n_routed_experts``).
+        # AlloyConfig accepts it because dsv4_moe port reads it directly;
+        # DeepseekV4Config reads it as the storage field for its
+        # ``num_local_experts`` attribute_map alias.
+        n_routed_experts=4,
         num_experts_per_tok=2,
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
