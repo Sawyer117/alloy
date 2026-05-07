@@ -20,7 +20,7 @@ from .modules.shared.rotary import RotaryEmbedding
 # mixer / FFN classes are looked up by string via get_mixer / get_ffn at
 # AlloyDecoderLayer construction time and ship their own ``init_weights`` —
 # this file never knows their names.
-from .modules.shared.norm import RMSNorm
+from .modules.shared.norm import DeepseekV4UnweightedRMSNorm, RMSNorm
 
 
 def _accepted_param_names(fn: Callable) -> frozenset[str]:
@@ -154,6 +154,196 @@ class AlloyDecoderLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# MHC (Manifold-Constrained Hyper-Connections, DSV4 paper §2.2)
+# ---------------------------------------------------------------------------
+# Toggled by ``config.use_mhc=True``. AlloyModel switches from
+# :class:`AlloyDecoderLayer` (single-stream) to :class:`AlloyMhcDecoderLayer`
+# (hc_mult parallel residual streams, mixed via HyperConnection between
+# every sublayer + collapsed at the end via HyperHead before the final
+# norm). Mixer / FFN modules see the same single-stream input as in the
+# non-MHC path — MHC purely changes how residuals flow.
+#
+# Ported from references/dsv4/modeling_deepseek_v4.py:810-906
+# (DeepseekV4HyperConnection + DeepseekV4HyperHead).
+
+
+class _HyperConnection(nn.Module):
+    r"""mHC mapping at one sublayer site.
+
+    Takes ``hidden_streams`` of shape ``[B, S, hc_mult, D]``, returns
+    ``(post, comb, collapsed)``:
+
+      * ``collapsed`` ``[B, S, D]`` — single-stream input for the sublayer
+        (attn / mlp), built as a learned weighted sum across the stream
+        axis using the ``pre`` weights.
+      * ``post`` ``[B, S, hc_mult]`` — per-stream weights for placing
+        the sublayer's single-stream output back into the multi-stream
+        residual.
+      * ``comb`` ``[B, S, hc_mult, hc_mult]`` — Sinkhorn-Knopp projected
+        doubly-stochastic mixing matrix that combines the existing
+        streams.
+
+    The decoder layer uses TWO instances of this — ``attn_hc`` for the
+    attention site, ``ffn_hc`` for the MLP site.
+    """
+
+    def __init__(self, config: AlloyConfig) -> None:
+        super().__init__()
+        self.hc_mult = config.hc_mult
+        self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
+        self.hc_eps = config.hc_eps
+        self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
+        # ``mix`` outputs cover (pre, post, comb) for hc_mult streams:
+        #   pre  : hc_mult logits
+        #   post : hc_mult logits
+        #   comb : hc_mult x hc_mult logits
+        # Total = (2 + hc_mult) * hc_mult.
+        mix = (2 + self.hc_mult) * self.hc_mult
+        self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.hidden_size))
+        self.base = nn.Parameter(torch.empty(mix))
+        # Per-output-class scale: index 0 = pre, 1 = post, 2 = comb.
+        self.scale = nn.Parameter(torch.empty(3))
+
+    def forward(
+        self, hidden_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
+        mix = torch.nn.functional.linear(flat, self.fn.float())
+        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
+        hc = self.hc_mult
+        pre = torch.sigmoid(mix[..., :hc] * pre_scale + self.base[:hc]) + self.hc_eps
+        post = torch.sigmoid(mix[..., hc: 2 * hc] * post_scale + self.base[hc: 2 * hc]) + self.hc_eps
+        comb = (
+            torch.sigmoid(
+                mix[..., 2 * hc:].view(*mix.shape[:-1], hc, hc) * comb_scale
+                + self.base[2 * hc:].view(hc, hc)
+            )
+            + self.hc_eps
+        )
+        # Sinkhorn-Knopp projection onto the doubly-stochastic manifold:
+        # alternate row + column normalisation for ``hc_sinkhorn_iters`` steps.
+        for _ in range(self.hc_sinkhorn_iters):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
+        # Collapse hc_mult parallel streams into a single sequence ready
+        # for the sublayer (attn / mlp).
+        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+        return post, comb, collapsed
+
+
+class _HyperHead(nn.Module):
+    """Final HC-stream collapse before the shared RMSNorm.
+
+    Reduces ``[B, S, hc_mult, D]`` back to ``[B, S, D]`` so the rest of the
+    head (final norm + lm_head) stays single-stream. Lighter than
+    :class:`_HyperConnection` — only computes the ``pre`` collapse weights,
+    not the ``post`` / ``comb`` placement.
+    """
+
+    def __init__(self, config: AlloyConfig) -> None:
+        super().__init__()
+        self.hc_mult = config.hc_mult
+        self.input_norm = DeepseekV4UnweightedRMSNorm(eps=config.rms_norm_eps)
+        self.eps = config.hc_eps
+        self.hc_fn = nn.Parameter(torch.empty(self.hc_mult, self.hc_mult * config.hidden_size))
+        self.hc_base = nn.Parameter(torch.empty(self.hc_mult))
+        self.hc_scale = nn.Parameter(torch.empty(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        flat = self.input_norm(x.flatten(2).float())
+        mixes = torch.nn.functional.linear(flat, self.hc_fn.float())
+        pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
+        return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
+
+
+class AlloyMhcDecoderLayer(nn.Module):
+    """Decoder block with multi-stream residual flow (MHC variant).
+
+    Same mixer / FFN dispatch as :class:`AlloyDecoderLayer` (so any
+    registered mixer + ffn pair works behind MHC), but the residual
+    machinery is replaced:
+
+      * Input/output shape is ``[B, S, hc_mult, D]`` (not ``[B, S, D]``).
+      * Two :class:`_HyperConnection` instances (``attn_hc``, ``ffn_hc``)
+        collapse the streams down for the sublayer + place its output
+        back across the streams.
+      * Sublayer (attn / mlp) sees a single ``[B, S, D]`` tensor — it
+        doesn't know MHC exists. This is what lets us A/B test MHC on
+        any alloy config (qwen3 / qwen3.5 / dsv4) just by flipping
+        ``config.use_mhc``.
+    """
+
+    def __init__(self, config: AlloyConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.layer_type = config.layer_types[layer_idx]
+        self.ffn_type = config.ffn_types[layer_idx]
+
+        mixer_entry = get_mixer(self.layer_type)
+        self._mixer_attr = mixer_entry.attr_name
+        setattr(self, self._mixer_attr, mixer_entry.cls(config, layer_idx))
+
+        ffn_cls = get_ffn(self.ffn_type)
+        self.mlp = ffn_cls(config, layer_idx)
+
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
+        )
+
+        self.attn_hc = _HyperConnection(config)
+        self.ffn_hc = _HyperConnection(config)
+
+    @property
+    def mixer(self) -> nn.Module:
+        return getattr(self, self._mixer_attr)
+
+    def forward(
+        self,
+        hidden_streams: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        input_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        dtype = hidden_streams.dtype
+
+        # Attention site.
+        post, comb, collapsed = self.attn_hc(hidden_streams)
+        mixer_out = self.mixer(
+            hidden_states=self.input_layernorm(collapsed),
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        if isinstance(mixer_out, tuple):
+            mixer_out = mixer_out[0]
+        # Reblend single-stream sublayer output back into multi-stream:
+        #   post[..., None] * mixer_out[..., None, :] + comb @ hidden_streams
+        hidden_streams = (
+            post.to(dtype).unsqueeze(-1) * mixer_out.unsqueeze(-2)
+            + torch.matmul(comb.to(dtype), hidden_streams)
+        )
+
+        # MLP site (same shape of mix as attention).
+        post, comb, collapsed = self.ffn_hc(hidden_streams)
+        mlp_out = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
+        if isinstance(mlp_out, tuple):
+            mlp_out = mlp_out[0]
+        hidden_streams = (
+            post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2)
+            + torch.matmul(comb.to(dtype), hidden_streams)
+        )
+        return hidden_streams
+
+
+# ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
 
@@ -278,13 +468,25 @@ class AlloyModel(AlloyPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # MHC toggles which DecoderLayer class to use. The single-stream
+        # AlloyDecoderLayer keeps the standard residual flow; the MHC variant
+        # owns hc_mult parallel residual streams plus per-site HyperConnection
+        # mixing. Both share the same mixer/ffn registry, so a model can have
+        # any layer_types/ffn_types combo on either path.
+        layer_cls = AlloyMhcDecoderLayer if getattr(config, "use_mhc", False) else AlloyDecoderLayer
         self.layers = nn.ModuleList(
-            [AlloyDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [layer_cls(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
         )
         self.rotary_emb = RotaryEmbedding(config=config)
+        # MHC head: collapses multi-stream back to single-stream just before
+        # the final norm. Only built when use_mhc=True so non-MHC models
+        # don't carry the parameter overhead.
+        self.hc_head: _HyperHead | None = (
+            _HyperHead(config) if getattr(config, "use_mhc", False) else None
+        )
         self.gradient_checkpointing = False
 
         self._mask_kinds = tuple(get_mixer(name).mask_kind for name in config.layer_types)
@@ -375,6 +577,17 @@ class AlloyModel(AlloyPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
+        # MHC mode: expand the embedding output into hc_mult parallel
+        # residual streams. AlloyMhcDecoderLayer takes [B, S, hc_mult, D]
+        # in/out, mixing the streams via HyperConnection at every sublayer
+        # site. Non-MHC mode leaves hidden_states as [B, S, D].
+        if self.hc_head is not None:
+            hidden_states = (
+                hidden_states.unsqueeze(2)
+                .expand(-1, -1, self.config.hc_mult, -1)
+                .contiguous()
+            )
+
         for i, layer in enumerate(self.layers):
             layer_mask = mask_for_kind.get(self._mask_kinds[i])
             hidden_states = layer(
@@ -389,6 +602,10 @@ class AlloyModel(AlloyPreTrainedModel):
                 # **kwargs at the FFN forward.
                 input_ids=input_ids,
             )
+
+        # Collapse hc_mult streams back to [B, S, D] before the final norm.
+        if self.hc_head is not None:
+            hidden_states = self.hc_head(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(

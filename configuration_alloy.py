@@ -166,6 +166,8 @@ class AlloyConfig(PretrainedConfig):
         ("index_n_heads", "index_head_dim", "index_topk"),
         # DeepSeek-V4 compression rates per layer type (HCA / CSA)
         ("compress_rates",),
+        # Manifold-Constrained Hyper-Connections (MHC)
+        ("use_mhc", "hc_mult", "hc_sinkhorn_iters", "hc_eps"),
     )
 
     def __init__(
@@ -229,6 +231,14 @@ class AlloyConfig(PretrainedConfig):
         # the DSV4Config defaults; only consumed by HCA/CSA layers and the
         # corresponding cache classes.
         compress_rates: dict | None = None,
+        # Manifold-Constrained Hyper-Connections (DSV4 paper §2.2).
+        # use_mhc=False (default): single-stream model; use_mhc=True
+        # switches AlloyModel to use AlloyMhcDecoderLayer + HyperHead,
+        # multi-stream residual flow with hc_mult parallel streams.
+        use_mhc: bool = False,
+        hc_mult: int = 4,
+        hc_sinkhorn_iters: int = 4,
+        hc_eps: float = 1e-6,
         **kwargs,
     ) -> None:
         self.vocab_size = vocab_size
@@ -279,6 +289,11 @@ class AlloyConfig(PretrainedConfig):
             if compress_rates is not None
             else {"compressed_sparse_attention": 4, "heavily_compressed_attention": 128}
         )
+        # MHC (Manifold-Constrained Hyper-Connections)
+        self.use_mhc = use_mhc
+        self.hc_mult = hc_mult
+        self.hc_sinkhorn_iters = hc_sinkhorn_iters
+        self.hc_eps = hc_eps
 
         if rope_parameters is None:
             rope_parameters = {"rope_type": "default", "rope_theta": 10000.0}
