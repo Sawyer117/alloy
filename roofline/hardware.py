@@ -183,6 +183,92 @@ def get_hardware(name_or_obj) -> Hardware:
     return PRESETS[name_or_obj]
 
 
+# --------------------------------------------------------------------------- #
+# Custom hardware factory — kwarg-style construction
+# --------------------------------------------------------------------------- #
+
+
+def CustomHardware(
+    name: str = "custom",
+    *,
+    hbm_bandwidth: float,
+    int8: Optional[float] = None,
+    fp8: Optional[float] = None,
+    fp16: Optional[float] = None,
+    bf16: Optional[float] = None,
+    fp32: Optional[float] = None,
+    fp64: Optional[float] = None,
+    vector_fp16: Optional[float] = None,
+    vector_bf16: Optional[float] = None,
+    vector_fp32: Optional[float] = None,
+) -> Hardware:
+    """Build a :class:`Hardware` from named-dtype keyword args.
+
+    Each compute kwarg is the peak FLOP/s (or TOPS for int8) on the cube /
+    tensor-core unit; ``vector_*`` go to the separate vector unit on
+    Ascend-style hardware (leave None on NVIDIA where the distinction
+    doesn't apply). ``hbm_bandwidth`` is bytes/s.
+
+    Pass numbers in absolute units — ``989e12`` for 989 TFLOPS, ``3.35e12``
+    for 3.35 TB/s — or use the module-level ``T`` / ``G`` constants
+    (``989 * T``, ``3.35 * T``).
+
+    Unspecified dtypes are absent from the resulting ``peak_flops`` dict;
+    calling ``roofline(..., dtype=that_missing_dtype, ...)`` will raise a
+    helpful KeyError.
+
+    Example::
+
+        from alloy.roofline import CustomHardware, roofline_prefill
+
+        my_chip = CustomHardware(
+            name="my-chip-v1",
+            hbm_bandwidth=4e12,     # 4 TB/s
+            bf16=1500e12,           # 1500 TFLOPS BF16
+            fp32=200e12,
+            int8=3000e12,
+        )
+        report = roofline_prefill(config, batch=1, seq_len=4096, hardware=my_chip)
+    """
+    peak: dict[torch.dtype, float] = {}
+    if int8 is not None:
+        peak[torch.int8] = int8
+    if fp16 is not None:
+        peak[torch.float16] = fp16
+    if bf16 is not None:
+        peak[torch.bfloat16] = bf16
+    if fp32 is not None:
+        peak[torch.float32] = fp32
+    if fp64 is not None:
+        peak[torch.float64] = fp64
+    if fp8 is not None:
+        if hasattr(torch, "float8_e4m3fn"):
+            peak[torch.float8_e4m3fn] = fp8
+        else:
+            raise ValueError(
+                "fp8 specified but this torch version lacks torch.float8_e4m3fn. "
+                "Upgrade to torch>=2.1, or construct Hardware(...) directly with "
+                "a custom dtype key if you need a non-standard quantization format."
+            )
+
+    vec: Optional[dict[torch.dtype, float]] = None
+    if any(v is not None for v in (vector_fp16, vector_bf16, vector_fp32)):
+        vec = {}
+        if vector_fp16 is not None:
+            vec[torch.float16] = vector_fp16
+        if vector_bf16 is not None:
+            vec[torch.bfloat16] = vector_bf16
+        if vector_fp32 is not None:
+            vec[torch.float32] = vector_fp32
+
+    return Hardware(
+        name=name,
+        peak_flops=peak,
+        hbm_bandwidth=hbm_bandwidth,
+        peak_vector_flops=vec,
+    )
+
+
 __all__ = [
     "Hardware",
     "A100",
@@ -192,4 +278,7 @@ __all__ = [
     "ASCEND_910C",
     "PRESETS",
     "get_hardware",
+    "CustomHardware",
+    "T",
+    "G",
 ]

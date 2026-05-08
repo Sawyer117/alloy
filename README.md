@@ -81,21 +81,32 @@ both GPU and Ascend NPU.
 **purely analytical, config-driven, no model construction**. Handles
 10T-parameter configs in O(num_layers) time. Three modes
 (prefill / mini-prefill / decode), four hardware presets
-(A100 / H100 / Ascend910B1 / Ascend910C), auto-scaled report.
+(A100 / H100 / Ascend910B1 / Ascend910C) plus `CustomHardware(...)` for
+chips not in the preset list, auto-scaled report.
 
 ```python
-from alloy.roofline import roofline_prefill, roofline_mini_prefill, roofline_decode
+from alloy.roofline import (
+    CustomHardware, roofline_prefill, roofline_mini_prefill, roofline_decode,
+)
+
+# Custom chip not in the preset list — build from kwargs (numbers are illustrative)
+my_device = CustomHardware(
+    name="my-device", hbm_bandwidth=8e12,
+    bf16=2250e12, fp32=80e12, fp8=4500e12,
+)
 
 # Print one full report to see the format
 print(roofline_prefill(config, batch=1, seq_len=4096, hardware="H100"))
 
 # Three modes (cold prefill / mini-prefill / decode) cover the serving pipeline.
+# Mix preset strings and CustomHardware instances freely.
 # FLOPs and bytes are config-determined; only timing changes per device.
-for hw in ["H100", "Ascend910C"]:
+for hw in ["H100", "Ascend910C", my_device]:
     p = roofline_prefill     (config, batch=1, seq_len=4096, hardware=hw)
     m = roofline_mini_prefill(config, batch=1, chunk_len=512, kv_cache_len=2048, hardware=hw)
     d = roofline_decode      (config, batch=1, kv_cache_len=4096, hardware=hw)
-    print(f"{hw:11}  prefill: {p.roofline_time_s*1e3:>5.2f} ms ({p.bottleneck:7})"
+    name = hw if isinstance(hw, str) else hw.name
+    print(f"{name:11}  prefill: {p.roofline_time_s*1e3:>5.2f} ms ({p.bottleneck:7})"
           f"  mini: {m.roofline_time_s*1e3:>5.2f} ms ({m.bottleneck:7})"
           f"  decode: {d.roofline_time_s*1e6:>4.0f} us ({d.bottleneck})")
 ```
@@ -108,7 +119,13 @@ H100-SXM5: compute=10.30 ms, memory=1.12 ms -> bottleneck=compute (10.30 ms / fo
 
 H100         prefill: 10.30 ms (compute)  mini:  1.26 ms (compute)  decode:  702 us (memory)
 Ascend910C   prefill: 13.43 ms (compute)  mini:  1.65 ms (compute)  decode:  735 us (memory)
+my-device    prefill:  4.53 ms (compute)  mini:  0.55 ms (compute)  decode:  294 us (memory)
 ```
+
+`CustomHardware(...)` accepts named-dtype kwargs (`int8` / `fp8` / `fp16` /
+`bf16` / `fp32` / `fp64` for the cube/tensor unit, `vector_*` for Ascend-style
+separate vector throughput), all in absolute FLOP/s. It returns a regular
+`Hardware` instance — pass it to `hardware=` anywhere a preset string works.
 
 ---
 

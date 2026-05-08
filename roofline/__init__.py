@@ -36,6 +36,7 @@ from .hardware import (
     ASCEND_910C,
     H100,
     PRESETS,
+    CustomHardware,
     Hardware,
     get_hardware,
 )
@@ -74,6 +75,7 @@ __all__ = [
     "dtype_size",
     # Hardware
     "Hardware",
+    "CustomHardware",
     "A100",
     "H100",
     "ASCEND_910B",

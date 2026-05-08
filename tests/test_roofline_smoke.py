@@ -32,6 +32,7 @@ from alloy.roofline import (
     ASCEND_910B,
     ASCEND_910B1,
     ASCEND_910C,
+    CustomHardware,
     H100,
     PRESETS,
     Hardware,
@@ -217,6 +218,96 @@ def test_hardware_presets():
 # --------------------------------------------------------------------------- #
 
 
+def test_custom_hardware_factory():
+    """CustomHardware(name=..., bf16=..., hbm_bandwidth=...) returns a Hardware
+    that behaves identically to one constructed via Hardware(...) directly."""
+    # Build same H100-like spec two ways and compare
+    via_factory = CustomHardware(
+        name="my-h100",
+        hbm_bandwidth=3.35e12,
+        bf16=989e12,
+        fp16=989e12,
+        fp32=67e12,
+    )
+    via_direct = Hardware(
+        name="my-h100",
+        peak_flops={
+            torch.bfloat16: 989e12,
+            torch.float16: 989e12,
+            torch.float32: 67e12,
+        },
+        hbm_bandwidth=3.35e12,
+    )
+    assert isinstance(via_factory, Hardware)
+    assert via_factory.name == via_direct.name
+    assert via_factory.hbm_bandwidth == via_direct.hbm_bandwidth
+    assert via_factory.peak_flops == via_direct.peak_flops
+    assert via_factory.peak_vector_flops is None  # not provided
+    print("[ok] CustomHardware factory matches direct Hardware construction")
+
+
+def test_custom_hardware_with_vector_unit():
+    """Specifying any vector_* kwarg populates peak_vector_flops."""
+    hw = CustomHardware(
+        name="my-ascend",
+        hbm_bandwidth=2e12,
+        bf16=400e12,
+        vector_fp16=24e12,
+        vector_fp32=12e12,
+    )
+    assert hw.peak_vector_flops is not None
+    assert hw.get_peak_vector_flops(torch.float16) == 24e12
+    assert hw.get_peak_vector_flops(torch.float32) == 12e12
+    assert hw.get_peak_vector_flops(torch.bfloat16) is None  # not specified
+    print("[ok] CustomHardware vector unit populates peak_vector_flops")
+
+
+def test_custom_hardware_works_through_roofline():
+    """End-to-end: build a custom hardware, pass to roofline(), verify the
+    result uses our custom numbers."""
+    custom = CustomHardware(
+        name="dummy-fast-chip",
+        hbm_bandwidth=10e12,    # 10 TB/s (very high)
+        bf16=2000e12,           # 2 PFLOPS BF16 (very high)
+    )
+    config = SimpleNamespace(
+        layer_types=[], ffn_types=[],
+        hidden_size=128, vocab_size=1024, tie_word_embeddings=False,
+    )
+    report = roofline(config, batch=1, query_len=8, dtype=torch.bfloat16, hardware=custom)
+    assert report.hardware is custom
+    assert report.hardware.name == "dummy-fast-chip"
+    # compute_time = total_flops / 2e15 (very fast)
+    # memory_time = total_bytes / 1e13 (very fast too)
+    # both should be sub-microsecond for this tiny model
+    assert report.roofline_time_s < 1e-6
+    print(f"[ok] CustomHardware end-to-end: roofline_time = {report.roofline_time_s*1e9:.1f} ns")
+
+
+def test_custom_hardware_roundtrips_through_get_hardware():
+    """get_hardware should pass-through Hardware instances unchanged."""
+    custom = CustomHardware(name="x", hbm_bandwidth=1e12, bf16=100e12)
+    assert get_hardware(custom) is custom
+    print("[ok] get_hardware passes through CustomHardware")
+
+
+def test_custom_hardware_fp8_when_available():
+    """fp8 kwarg works when torch has float8_e4m3fn; raises a helpful error
+    on older torch."""
+    if hasattr(torch, "float8_e4m3fn"):
+        hw = CustomHardware(name="h100-fp8", hbm_bandwidth=3.35e12, fp8=1979e12)
+        assert hw.peak_flops[torch.float8_e4m3fn] == 1979e12
+        print("[ok] CustomHardware fp8 stored under torch.float8_e4m3fn")
+    else:
+        try:
+            CustomHardware(name="x", hbm_bandwidth=1e12, fp8=1000e12)
+        except ValueError as e:
+            assert "fp8" in str(e).lower()
+            print(f"[ok] CustomHardware fp8 raises on old torch: {e}")
+            return
+        raise AssertionError("expected ValueError on fp8 with old torch")
+
+
 def test_roofline_end_to_end():
     """Tiny synthetic 'model': 2 layers, each layer is 1 mixer-as-Linear + 1
     ffn-as-Linear, all hidden=128. Verifies aggregation and the embedding /
@@ -345,6 +436,11 @@ def main() -> int:
     test_get_spec_missing_strict_raises()
     test_register_spec_type_check()
     test_hardware_presets()
+    test_custom_hardware_factory()
+    test_custom_hardware_with_vector_unit()
+    test_custom_hardware_works_through_roofline()
+    test_custom_hardware_roundtrips_through_get_hardware()
+    test_custom_hardware_fp8_when_available()
     test_roofline_end_to_end()
     test_roofline_strict_missing_raises()
     test_roofline_fail_open_marks_unknown()
