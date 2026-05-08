@@ -53,7 +53,7 @@ from .specs import (
 # binding specs to the same names used by register_ffn / register_mixer in
 # alloy.modules. Mirrors how alloy/__init__.py imports alloy.modules to
 # trigger mixer/ffn registration.
-from . import specs_attention, specs_ffn  # noqa: F401
+from . import specs_attention, specs_ffn, specs_gdn  # noqa: F401
 
 
 __all__ = [
