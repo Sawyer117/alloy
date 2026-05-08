@@ -286,6 +286,143 @@ register_spec("dsv4_hca_attention", DSV4AttentionSpec("dsv4_hca_attention"))
 register_spec("dsv4_csa_attention", DSV4AttentionSpec("dsv4_csa_attention"))
 
 
+# =========================================================================== #
+# Qwen3 standard MHA / GQA attention spec
+# =========================================================================== #
+
+
+def _qwen3_effective_kv_len(query_len: int, layer_type: str, config, *, kv_cache_len: int = 0) -> int:
+    """KV length each query attends to.
+
+    Full causal: attends to entire prefix + queries (total_seq).
+    Sliding: capped at ``config.sliding_window``.
+    """
+    total_seq = query_len + kv_cache_len
+    if layer_type == "qwen3_attention_sliding":
+        return min(total_seq, config.sliding_window)
+    return total_seq
+
+
+class Qwen3AttentionSpec(RooflineSpec):
+    r"""Spec for Qwen3 / Qwen3.5 standard MHA + GQA attention.
+
+    One class registered under two names:
+
+      * ``qwen3_attention``         — full causal, KV_len = total_seq
+      * ``qwen3_attention_sliding`` — sliding window, KV_len capped at
+                                       ``config.sliding_window``
+
+    GQA: ``num_key_value_heads`` may be < ``num_attention_heads``. Each
+    KV head is broadcast to ``num_heads / num_kv_heads`` query heads
+    inside SDPA. Reduces KV-side HBM bandwidth by the GQA factor (this is
+    the headline GQA advantage for long-context decode).
+
+    Optional features:
+
+      * ``attn_output_gate=True`` (qwen3.5 style) — q_proj produces 2x
+        output; second half is sigmoid-gated against attention output
+        before o_proj. Adds ~num_heads*head_dim weight + small flops.
+      * ``attention_bias=True`` — bias terms on q/k/v/o linears.
+
+    Skipped in v1 (sub-1% combined): RMSNorm on q/k, RoPE.
+    """
+
+    def __init__(self, layer_type: str) -> None:
+        if layer_type not in {"qwen3_attention", "qwen3_attention_sliding"}:
+            raise ValueError(f"unknown qwen3 layer type: {layer_type!r}")
+        self.layer_type = layer_type
+
+    def _check_in_shape(self, in_shape: tuple[int, ...]) -> tuple[int, int]:
+        if len(in_shape) != 3:
+            raise ValueError(
+                f"Qwen3AttentionSpec expects 3D in_shape (batch, query_len, hidden); "
+                f"got {in_shape}."
+            )
+        return in_shape[0], in_shape[1]
+
+    def _read_config(self, config) -> dict:
+        hidden = config.hidden_size
+        num_heads = config.num_attention_heads
+        num_kv_heads = config.num_key_value_heads
+        head_dim = getattr(config, "head_dim", None) or (hidden // num_heads)
+        return {
+            "hidden": hidden,
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "q_dim": num_heads * head_dim,
+            "kv_dim": num_kv_heads * head_dim,
+            "gate_mul": 2 if bool(getattr(config, "attn_output_gate", False)) else 1,
+            "bias": bool(getattr(config, "attention_bias", False)),
+        }
+
+    def flops(self, in_shape: tuple[int, ...], config, **kwargs) -> int:
+        kv_cache_len = int(kwargs.get("kv_cache_len", 0))
+        batch, query_len = self._check_in_shape(in_shape)
+        d = self._read_config(config)
+        n_query_tokens = batch * query_len
+        kv_len = _qwen3_effective_kv_len(query_len, self.layer_type, config, kv_cache_len=kv_cache_len)
+
+        # Linear projections
+        flops = (
+            2 * n_query_tokens * d["hidden"] * (d["q_dim"] * d["gate_mul"])  # q_proj (× gate_mul if gated)
+            + 2 * n_query_tokens * d["hidden"] * d["kv_dim"]                  # k_proj
+            + 2 * n_query_tokens * d["hidden"] * d["kv_dim"]                  # v_proj
+            + 2 * n_query_tokens * d["q_dim"] * d["hidden"]                   # o_proj
+        )
+        if d["bias"]:
+            flops += n_query_tokens * (
+                d["q_dim"] * d["gate_mul"] + 2 * d["kv_dim"] + d["hidden"]
+            )
+
+        # SDPA: QK^T + AV at effective KV_len. Q has full num_heads;
+        # K/V are GQA-grouped but broadcast for the matmul, so flop count
+        # uses num_heads on both passes.
+        flops += 4 * batch * d["num_heads"] * query_len * kv_len * d["head_dim"]
+
+        # Output gate (qwen3.5 style): sigmoid + elementwise mul on [N, q_dim]
+        # ~3 flops/elem for sigmoid + 1 for mul ≈ 4·N·q_dim
+        if d["gate_mul"] == 2:
+            flops += 4 * n_query_tokens * d["q_dim"]
+
+        return flops
+
+    def bytes(self, in_shape: tuple[int, ...], config, dtype: torch.dtype, **kwargs) -> int:
+        kv_cache_len = int(kwargs.get("kv_cache_len", 0))
+        batch, query_len = self._check_in_shape(in_shape)
+        d = self._read_config(config)
+        es = dtype_size(dtype)
+        n_query_tokens = batch * query_len
+        kv_len = _qwen3_effective_kv_len(query_len, self.layer_type, config, kv_cache_len=kv_cache_len)
+
+        # Weight bytes
+        weights = (
+            d["hidden"] * (d["q_dim"] * d["gate_mul"]) * es   # q_proj
+            + d["hidden"] * d["kv_dim"] * es                   # k_proj
+            + d["hidden"] * d["kv_dim"] * es                   # v_proj
+            + d["q_dim"] * d["hidden"] * es                    # o_proj
+            + 2 * d["head_dim"] * es                           # q_norm + k_norm gains
+        )
+        if d["bias"]:
+            weights += (d["q_dim"] * d["gate_mul"] + 2 * d["kv_dim"] + d["hidden"]) * es
+
+        # Activations under fusion: input read, output written
+        act_in = n_query_tokens * d["hidden"] * es
+        act_out = n_query_tokens * d["hidden"] * es
+
+        # KV materialization in HBM. K and V are SEPARATE tensors (no V==K
+        # sharing as in DSV4), so 2× the per-tensor traffic. GQA reduces by
+        # using num_kv_heads instead of num_heads.
+        kv_act = batch * 2 * d["num_kv_heads"] * kv_len * d["head_dim"] * es
+
+        return weights + act_in + act_out + kv_act
+
+
+register_spec("qwen3_attention", Qwen3AttentionSpec("qwen3_attention"))
+register_spec("qwen3_attention_sliding", Qwen3AttentionSpec("qwen3_attention_sliding"))
+
+
 __all__ = [
     "DSV4AttentionSpec",
+    "Qwen3AttentionSpec",
 ]
