@@ -1,0 +1,291 @@
+"""DSV4 attention roofline spec — one class for all 3 layer types.
+
+Models DSV4 attention as standard SDPA with an *effective KV length per query*
+that varies by layer flavor and depends on (query_len + kv_cache_len) — the
+full context length, not just the new tokens being processed this forward:
+
+  * ``dsv4_sliding_attention``  — KV_len = min(Q+P, sliding_window)
+  * ``dsv4_hca_attention``      — KV_len = min(Q+P, W) + ceil((Q+P) / hca_rate)
+                                  (sliding + heavy compressed entries)
+  * ``dsv4_csa_attention``      — KV_len = min(Q+P, W) + index_topk
+                                  (sliding + Lightning-Indexer-gated entries)
+
+Where Q = ``query_len`` (new tokens this forward), P = ``kv_cache_len``
+(tokens already in cache from previous forwards). For prefill from cold
+P=0, so KV_len reduces to f(Q). For decode Q=1, P=full_context, so KV_len
+is dominated by P. Mini-prefill is a chunk with Q=chunk_len and P=prefix.
+
+DSV4 is MQA (``num_kv_heads == 1``): K and V are a single shared head broadcast
+to all attention heads, halving KV-side activation traffic; under fusion the
+shared K/V tensor is also read once for both the QK and AV stages.
+
+Components included (matmul-dominated, 95%+ of total compute):
+
+  * Q LoRA projection (``q_a_proj`` + ``q_b_proj``) — Q new tokens
+  * KV projection (``kv_proj``, MQA single head) — Q new tokens
+  * Compressor projections (HCA/CSA only) — Q new tokens
+  * Main SDPA at effective KV_len — Q queries × full effective KV
+  * Output: grouped ``o_a_proj`` (block-diagonal) + ``o_b_proj`` — Q new tokens
+  * Lightning Indexer (CSA only) — Q queries × n_compressed (full context's
+    compressed entries, including those cached from previous forwards)
+
+Components skipped (sub-1% combined for typical sizes):
+
+  * RMSNorm, RoPE, attention-mask handling
+  * Softmax FLOPs inside SDPA
+  * Compressor's softmax-over-windows + position-bias add
+  * Per-head sinks compute
+  * Distinct write of new KV entries to cache (small, tracked via
+    effective_kv_len since the read path dominates total HBM traffic)
+
+Bytes model: optimal-fusion FlashAttention assumptions — input X read once,
+output written once, all weight buffers read once each. The KV tensor IS
+materialized to HBM (too big for SRAM at any realistic context length) at
+effective KV_len, contributing ``B · 1 · KV_len · head_dim · es`` traffic
+(single MQA head, K==V shared).
+"""
+from __future__ import annotations
+
+import math
+
+import torch
+
+from .specs import RooflineSpec, dtype_size, register_spec
+
+
+def _effective_kv_len(query_len: int, layer_type: str, config, *, kv_cache_len: int = 0) -> int:
+    """KV length each query attends to, by layer type.
+
+    Computed over the full context (``query_len + kv_cache_len``); the cache
+    contributes most of the KV in mini-prefill / decode regimes.
+    """
+    total_seq = query_len + kv_cache_len
+    sw = min(total_seq, config.sliding_window)
+    if layer_type == "dsv4_sliding_attention":
+        return sw
+    if layer_type == "dsv4_hca_attention":
+        hca_rate = config.compress_rates["heavily_compressed_attention"]
+        return sw + math.ceil(total_seq / hca_rate)
+    if layer_type == "dsv4_csa_attention":
+        return sw + config.index_topk
+    raise KeyError(f"unknown DSV4 layer type: {layer_type!r}")
+
+
+def _projection_flops(n_query_tokens: int, config) -> int:
+    """Q/KV/O matmul flops common to all 3 layer types — operate on Q new tokens.
+
+    DSV4 is MQA — kv_proj output dim is just ``head_dim``, not
+    ``num_kv_heads * head_dim``. Output is grouped: ``o_a_proj`` is block-
+    diagonal so its FLOPs equal a (n_heads*head_dim → o_lora_rank) projection
+    even though the weight is partitioned into ``o_groups`` blocks.
+    """
+    hidden = config.hidden_size
+    qlr = config.q_lora_rank
+    nh = config.num_attention_heads
+    hd = config.head_dim
+    og = config.o_groups
+    olr = config.o_lora_rank
+    return (
+        2 * n_query_tokens * hidden * qlr        # q_a_proj
+        + 2 * n_query_tokens * qlr * (nh * hd)   # q_b_proj
+        + 2 * n_query_tokens * hidden * hd       # kv_proj (MQA, single head)
+        + 2 * n_query_tokens * (nh * hd) * olr   # o_a_proj (grouped, equiv flops)
+        + 2 * n_query_tokens * (og * olr) * hidden  # o_b_proj
+    )
+
+
+def _projection_weights(config, es: int) -> int:
+    """Weight bytes for Q/KV/O projections + per-head sinks."""
+    hidden = config.hidden_size
+    qlr = config.q_lora_rank
+    nh = config.num_attention_heads
+    hd = config.head_dim
+    og = config.o_groups
+    olr = config.o_lora_rank
+    return (
+        hidden * qlr * es
+        + qlr * nh * hd * es
+        + hidden * hd * es
+        + nh * hd * olr * es
+        + og * olr * hidden * es
+        + nh * es
+    )
+
+
+def _hca_compressor_flops(query_len: int, config) -> int:
+    """HCA compressor: kv_proj + gate_proj on Q new tokens [hidden -> head_dim].
+
+    Cached compressed entries from previous forwards are NOT re-projected;
+    only the fresh ``query_len`` tokens flow through these linears each call.
+    """
+    hd = config.head_dim
+    return 2 * 2 * query_len * config.hidden_size * hd  # ×2 for kv + gate
+
+
+def _hca_compressor_weights(config, es: int) -> int:
+    hd = config.head_dim
+    rate = config.compress_rates["heavily_compressed_attention"]
+    return (
+        2 * config.hidden_size * hd * es
+        + rate * hd * es
+        + hd * es
+    )
+
+
+def _csa_compressor_flops(query_len: int, config) -> int:
+    """CSA compressor: kv_proj + gate_proj on Q new tokens [hidden -> 2*head_dim]."""
+    hd = config.head_dim
+    return 2 * 2 * query_len * config.hidden_size * (2 * hd)
+
+
+def _csa_compressor_weights(config, es: int) -> int:
+    hd = config.head_dim
+    rate = config.compress_rates["compressed_sparse_attention"]
+    return (
+        2 * config.hidden_size * (2 * hd) * es
+        + rate * (2 * hd) * es
+        + hd * es
+    )
+
+
+def _indexer_flops(batch: int, query_len: int, config, *, kv_cache_len: int = 0) -> int:
+    """Lightning Indexer FLOPs (CSA only).
+
+    The score matmul is ``query_len × n_compressed × index_head_dim`` per head,
+    where ``n_compressed = ceil((query_len + kv_cache_len) / csa_rate)`` covers
+    BOTH freshly emitted and previously cached compressed entries.
+
+    At long-context decode (Q=1, large P), this term grows as O(P/csa_rate)
+    per query — much smaller per-query than at prefill, but still the
+    dominant indexer cost since the projection terms scale with Q only.
+    The indexer's projections (kv_proj/gate_proj/q_b_proj/weights_proj)
+    operate on Q new tokens — cached compressed entries are not re-projected.
+    """
+    hidden = config.hidden_size
+    qlr = config.q_lora_rank
+    nih = config.index_n_heads
+    ihd = config.index_head_dim
+    csa_rate = config.compress_rates["compressed_sparse_attention"]
+    total_seq = query_len + kv_cache_len
+    n_compressed = math.ceil(total_seq / csa_rate)
+    n_query_tokens = batch * query_len
+    return (
+        2 * n_query_tokens * hidden * (2 * ihd)
+        + 2 * n_query_tokens * hidden * (2 * ihd)
+        + 2 * n_query_tokens * qlr * (nih * ihd)
+        + 2 * n_query_tokens * hidden * nih
+        + 2 * batch * query_len * nih * ihd * n_compressed
+    )
+
+
+def _indexer_weights(config, es: int) -> int:
+    hidden = config.hidden_size
+    qlr = config.q_lora_rank
+    nih = config.index_n_heads
+    ihd = config.index_head_dim
+    csa_rate = config.compress_rates["compressed_sparse_attention"]
+    return (
+        hidden * (2 * ihd) * es
+        + hidden * (2 * ihd) * es
+        + qlr * nih * ihd * es
+        + hidden * nih * es
+        + csa_rate * (2 * ihd) * es
+        + ihd * es
+    )
+
+
+# --------------------------------------------------------------------------- #
+# DSV4AttentionSpec — one spec instance per layer-type name.
+# --------------------------------------------------------------------------- #
+
+
+class DSV4AttentionSpec(RooflineSpec):
+    """DSV4 attention spec; instantiate one per layer type and register under
+    the matching name.
+
+    ``flops`` / ``bytes`` accept ``kv_cache_len`` via ``**kwargs`` for
+    mini-prefill / decode modes. Default ``kv_cache_len=0`` is the cold
+    prefill path.
+    """
+
+    def __init__(self, layer_type: str) -> None:
+        if layer_type not in {
+            "dsv4_sliding_attention",
+            "dsv4_hca_attention",
+            "dsv4_csa_attention",
+        }:
+            raise ValueError(f"unknown DSV4 layer type: {layer_type!r}")
+        self.layer_type = layer_type
+
+    def _check_in_shape(self, in_shape: tuple[int, ...]) -> tuple[int, int]:
+        if len(in_shape) != 3:
+            raise ValueError(
+                f"DSV4AttentionSpec expects 3D in_shape (batch, query_len, hidden); "
+                f"got {in_shape}."
+            )
+        return in_shape[0], in_shape[1]
+
+    def flops(self, in_shape: tuple[int, ...], config, **kwargs) -> int:
+        kv_cache_len = int(kwargs.get("kv_cache_len", 0))
+        batch, query_len = self._check_in_shape(in_shape)
+        n_query_tokens = batch * query_len
+        nh = config.num_attention_heads
+        hd = config.head_dim
+        kv_len = _effective_kv_len(query_len, self.layer_type, config, kv_cache_len=kv_cache_len)
+
+        # Q/KV/O projections + grouped output — operate on Q new tokens
+        flops = _projection_flops(n_query_tokens, config)
+
+        # Main SDPA: Q queries × full effective KV (cache + new)
+        flops += 4 * batch * nh * query_len * kv_len * hd
+
+        if self.layer_type == "dsv4_hca_attention":
+            flops += _hca_compressor_flops(query_len, config)
+        elif self.layer_type == "dsv4_csa_attention":
+            flops += _csa_compressor_flops(query_len, config)
+            flops += _indexer_flops(batch, query_len, config, kv_cache_len=kv_cache_len)
+
+        return flops
+
+    def bytes(self, in_shape: tuple[int, ...], config, dtype: torch.dtype, **kwargs) -> int:
+        kv_cache_len = int(kwargs.get("kv_cache_len", 0))
+        batch, query_len = self._check_in_shape(in_shape)
+        n_query_tokens = batch * query_len
+        hidden = config.hidden_size
+        hd = config.head_dim
+        es = dtype_size(dtype)
+        kv_len = _effective_kv_len(query_len, self.layer_type, config, kv_cache_len=kv_cache_len)
+
+        weights = _projection_weights(config, es)
+        if self.layer_type == "dsv4_hca_attention":
+            weights += _hca_compressor_weights(config, es)
+        elif self.layer_type == "dsv4_csa_attention":
+            weights += _csa_compressor_weights(config, es)
+            weights += _indexer_weights(config, es)
+
+        # Activation bytes under FlashAttention-style fusion:
+        #   * Input X read once (Q new tokens)
+        #   * Output written once (Q new tokens)
+        #   * KV tensor materialized in HBM at full effective length (single
+        #     MQA head, K==V shared) — covers cached + new entries; new-entry
+        #     write is folded in (small relative to the read).
+        act_in = n_query_tokens * hidden * es
+        act_out = n_query_tokens * hidden * es
+        kv_act = batch * 1 * kv_len * hd * es
+
+        return weights + act_in + act_out + kv_act
+
+
+# --------------------------------------------------------------------------- #
+# Registration
+# --------------------------------------------------------------------------- #
+
+
+register_spec("dsv4_sliding_attention", DSV4AttentionSpec("dsv4_sliding_attention"))
+register_spec("dsv4_hca_attention", DSV4AttentionSpec("dsv4_hca_attention"))
+register_spec("dsv4_csa_attention", DSV4AttentionSpec("dsv4_csa_attention"))
+
+
+__all__ = [
+    "DSV4AttentionSpec",
+]
