@@ -96,16 +96,48 @@ def test_bridge_callables_are_binder_originals() -> None:
 
 
 def test_activate_broadcast() -> None:
+    """String-broadcast resolves each operator's intent via
+    ``hf_npu_binder.DEFAULTS``, NOT a naive same-string set. Operators
+    without a kernel for the requested intent are translated to a
+    working fallback in their DEFAULTS entry.
+
+    Today's DEFAULTS:
+      - qwen3_5_moe.chunk_gated_delta_rule + experts both ship "flash",
+        so an intent of ``"flash"`` lands literally.
+      - deepseek_v4.sparse_flash_attention has no triton/flash port yet,
+        so every intent in its DEFAULTS entry maps to ``"torch"``.
+    """
     cfg = _gdn_config()
     model = type("FakeModel", (), {"config": cfg})()
     chosen = bridge.activate(model, prefer="flash")
     expected = {
         "_qwen3_5_gdn_implementation": "flash",
         "_experts_implementation":     "flash",
+        "_dsv4_csa_implementation":    "torch",  # SFA kernel port pending
     }
     assert chosen == expected, chosen
     assert getattr(cfg, "_qwen3_5_gdn_implementation") == "flash"
     assert getattr(cfg, "_experts_implementation") == "flash"
+    assert getattr(cfg, "_dsv4_csa_implementation") == "torch"
+
+
+def test_activate_auto_per_operator_recommendation() -> None:
+    """``activate(model, "auto")`` consults each operator's recommended
+    impl from ``hf_npu_binder.DEFAULTS`` — never blindly broadcasts
+    "auto" as a literal string (which would never resolve in
+    ``IMPL_REGISTRY``)."""
+    cfg = _gdn_config()
+    model = type("FakeModel", (), {"config": cfg})()
+    chosen = bridge.activate(model, prefer="auto")
+    # Each value must be an actual impl name registered in IMPL_REGISTRY,
+    # not the literal "auto".
+    assert "auto" not in chosen.values(), chosen
+    # GDN's current auto is triton; experts' is flash; SFA's is torch
+    # (kernel port pending). Update this expectation if binder's
+    # DEFAULTS changes.
+    assert chosen["_qwen3_5_gdn_implementation"] == "triton"
+    assert chosen["_experts_implementation"] == "flash"
+    assert chosen["_dsv4_csa_implementation"] == "torch"
 
 
 def test_activate_explicit_mapping_with_bare_module_key() -> None:

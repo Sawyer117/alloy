@@ -35,7 +35,7 @@ from torch import nn
 from transformers.cache_utils import Cache, DynamicSlidingWindowLayer
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from ..registry import register_mixer
+from ..registry import get_implementation, register_implementation, register_mixer
 from ..shared.attention_kernels import repeat_kv
 from ..shared.norm import DeepseekV4RMSNorm, DeepseekV4UnweightedRMSNorm
 from ..shared.rotary import (
@@ -285,7 +285,9 @@ class DeepseekV4HCACompressor(nn.Module):
 
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
-        return compressed.unsqueeze(1)
+        # HCA has no Lightning Indexer; the third slot is None so the caller's
+        # 3-tuple unpack is uniform with CSA.
+        return compressed.unsqueeze(1), None, None
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -394,8 +396,24 @@ class DeepseekV4Indexer(nn.Module):
         scores = torch.matmul(q.float(), compressed_kv.transpose(-1, -2).float().unsqueeze(1))
         scores = F.relu(scores) * self.softmax_scale
         weights = self.weights_proj(hidden_states).float() * self.weights_scaling
-        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)
-        topk = min(self.index_topk, compressed_kv.shape[1])
+        index_scores = (scores * weights.unsqueeze(-1)).sum(dim=2)  # [B, S, T]
+        T = compressed_kv.shape[1]
+        topk = min(self.index_topk, T)
+
+        # Compressed block `s` covers source positions `[s*m, (s+1)*m)`. A query
+        # at absolute position `p` may only attend to blocks whose tokens are
+        # already in the past — i.e. block index < (p+1)//m. Mask future blocks
+        # to -inf before topk, then mark any picks still past the threshold
+        # with a `-1` sentinel for the CSA compressor's scatter-bias to drop.
+        if T > 0:
+            causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+            block_idx = torch.arange(T, device=index_scores.device)
+            future_mask = block_idx.view(1, 1, -1) >= causal_threshold.unsqueeze(-1)  # [B, S, T]
+            index_scores = index_scores.masked_fill(future_mask, float("-inf"))
+            topk_idxs = index_scores.topk(topk, dim=-1).indices  # [B, S, k]
+            invalid = topk_idxs >= causal_threshold.unsqueeze(-1)
+            return torch.where(invalid, torch.full_like(topk_idxs, -1), topk_idxs)
+
         return index_scores.topk(topk, dim=-1).indices
 
 
@@ -496,11 +514,28 @@ class DeepseekV4CSACompressor(nn.Module):
             compressed = cache_layer.update_compressor_states("compressor", compressed)
         compressed_kv = compressed.unsqueeze(1)
 
-        # Lightning Indexer: gather top-`index_topk` compressed entries per query.
-        topk = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)
-        expanded = compressed_kv.unsqueeze(2).expand(-1, -1, seq_len, -1, -1)
-        idx = topk.unsqueeze(1).unsqueeze(-1).expand(-1, 1, -1, -1, self.head_dim)
-        return torch.gather(expanded, 3, idx).reshape(batch, 1, -1, self.head_dim)
+        # Lightning Indexer: pick top-`index_topk` compressed entries per query.
+        # Indexer may return `-1` sentinels for queries with fewer ready blocks
+        # than `index_topk` (early prefill positions); route them to a sentinel
+        # column past the valid range when building the per-query bias below.
+        topk = self.indexer(hidden_states, q_residual, position_ids, past_key_values, layer_idx)  # [B, S, k]
+        T = compressed_kv.shape[2]
+
+        # Per-query scatter-bias over the `[B, 1, S, T]` compressed axis: query
+        # `t` gets `0.0` at its `k` indexer-picked slots and `-inf` everywhere
+        # else. Invalid `-1` picks land in a throwaway column at `T` which is
+        # dropped. Q·Kᵀ downstream is `[S, T]` instead of `[S, S*k]`, saving a
+        # `k * compress_rate_csa` factor over a gather-then-block-bias scheme.
+        valid = topk >= 0  # [B, S, k]
+        safe_topk = torch.where(valid, topk, torch.full_like(topk, T))  # invalid -> col `T`
+        compressed_bias = compressed_kv.new_full((batch, 1, seq_len, T + 1), float("-inf"))
+        compressed_bias.scatter_(-1, safe_topk.unsqueeze(1), 0.0)
+        compressed_bias = compressed_bias[..., :T]  # drop the sentinel column
+
+        # `topk` (with -1 sentinels intact) is returned alongside so kernel-side
+        # CSA attention impls that want raw per-query picks don't have to
+        # recover them from the scattered bias.
+        return compressed_kv, compressed_bias, topk
 
 
 # =========================================================================== #
@@ -552,6 +587,58 @@ _COMPRESSOR_CLASSES: dict[str, type | None] = {
     "dsv4_csa_attention": DeepseekV4CSACompressor,
     "dsv4_hca_attention": DeepseekV4HCACompressor,
 }
+
+
+# =========================================================================== #
+# CSA-specific attention dispatch surface
+# =========================================================================== #
+#
+# CSA layers want their attention call to be replaceable by accelerator
+# kernels (NPU SFA Triton, etc.) without touching HF's generic
+# ``ALL_ATTENTION_FUNCTIONS``. HCA / sliding layers continue to route through
+# HF's interface for ``_attn_implementation`` ("eager" / "sdpa" / "flash"); the
+# CSA branch goes through alloy's ``IMPL_REGISTRY`` instead, so external
+# fast-path packages (e.g. ``hf-npu-binder``) can register a ``"triton"`` impl
+# under ``"dsv4_csa.attention"`` without rebuilding HF's attention machinery.
+#
+# Contract: same signature as HF's eager attention, plus two CSA-only kwargs
+# threaded through ``**kwargs``:
+#
+#   ``csa_topk_idxs``       — [B, S, K] indexer output (``-1`` sentinels for
+#                             early-query invalid picks). The torch fallback
+#                             ignores it (uses ``attention_mask`` directly,
+#                             which already encodes the per-query bias);
+#                             kernel-side impls that want raw indices read it.
+#   ``compressed_seq_len``  — int T, the length of the compressed-KV segment
+#                             on the seq axis. Useful for kernels that need to
+#                             split sliding-window KV from compressed KV.
+#
+def _torch_csa_attention(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float | int = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch reference impl of CSA attention.
+
+    Body delegates to :func:`_eager_attention_with_sinks` — the per-query
+    scatter-bias is already encoded in ``attention_mask`` (built by
+    :class:`DeepseekV4CSACompressor`), so the eager path is byte-exact
+    correct on its own. Kept as a separate registered callable so that
+    backend packages can swap in faster kernels under the same key without
+    perturbing HCA / sliding layers.
+    """
+    return _eager_attention_with_sinks(
+        module, query, key, value, attention_mask,
+        scaling=scaling, dropout=dropout, **kwargs,
+    )
+
+
+register_implementation("dsv4_csa.attention", "torch", _torch_csa_attention)
 
 
 # =========================================================================== #
@@ -620,6 +707,24 @@ class DeepseekV4Attention(nn.Module):
         compressor_cls = _COMPRESSOR_CLASSES.get(self.layer_type)
         self.compressor = compressor_cls(config) if compressor_cls is not None else None
 
+        # CSA layers route their attention call through alloy's IMPL_REGISTRY
+        # so a backend package (hf-npu-binder, etc.) can register a faster
+        # ``"triton"`` impl under ``"dsv4_csa.attention"`` without affecting
+        # HCA / sliding layers (which keep going through HF's
+        # ``ALL_ATTENTION_FUNCTIONS`` for ``_attn_implementation`` selection).
+        # The torch default is registered at module-import time.
+        self._csa_attn_fn: Callable | None = None
+        if self.layer_type == "dsv4_csa_attention":
+            from ..registry import DEFAULT_IMPL
+            csa_impl = getattr(
+                config,
+                "_dsv4_csa_implementation",
+                DEFAULT_IMPL.get("dsv4_csa", "torch"),
+            )
+            self._csa_attn_fn = get_implementation(
+                "dsv4_csa.attention", csa_impl, fallback="torch",
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -646,37 +751,65 @@ class DeepseekV4Attention(nn.Module):
         if past_key_values is not None:  # sliding where K==V
             kv = past_key_values.update(kv, kv, self.layer_idx)[0]
 
+        compressed_bias: torch.Tensor | None = None
+        csa_topk_idxs: torch.Tensor | None = None
+        compressed_seq_len: int = 0
         if self.compressor is not None:  # CSA or HCA
-            compressed_kv = self.compressor(
+            compressed_kv, compressed_bias, csa_topk_idxs = self.compressor(
                 hidden_states, q_residual, position_ids, past_key_values, self.layer_idx
             )
+            compressed_seq_len = compressed_kv.shape[2]
             kv = torch.cat([kv, compressed_kv], dim=2)
 
         # The compressor concatenates extra entries onto the KV axis after the
-        # sliding-window cache update, so a tensor attention_mask (built for
-        # the pre-concat KV length) needs right-padding to cover them with 0
-        # (= "always attend"). Skip when attention_mask is a non-tensor
-        # (e.g. flex-attention BlockMask).
+        # sliding-window cache update. HCA leaves those columns see-all (pad
+        # with 0.0); CSA carries a per-query additive bias over the compressed
+        # range that gets spliced onto the mask. Skip when attention_mask is a
+        # non-tensor (e.g. flex-attention BlockMask).
         if isinstance(attention_mask, torch.Tensor) and kv.shape[2] > attention_mask.shape[-1]:
-            attention_mask = F.pad(
-                attention_mask, (0, kv.shape[2] - attention_mask.shape[-1]), value=0.0
-            )
+            extra = kv.shape[2] - attention_mask.shape[-1]
+            if compressed_bias is None:
+                attention_mask = F.pad(attention_mask, (0, extra), value=0.0)
+            else:
+                attention_mask = torch.cat(
+                    [attention_mask, compressed_bias.to(attention_mask.dtype)], dim=-1
+                )
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, _eager_attention_with_sinks
-        )
-        attn_output, attn_weights = attention_interface(
-            self,
-            q,
-            kv,
-            kv,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,
-            **kwargs,
-        )
+        if self._csa_attn_fn is not None:
+            # CSA layer: dispatch through alloy IMPL_REGISTRY. ``csa_topk_idxs``
+            # and ``compressed_seq_len`` are extra info that kernel-side impls
+            # may want; the torch fallback ignores them and reads the bias
+            # directly out of ``attention_mask``.
+            attn_output, attn_weights = self._csa_attn_fn(
+                self,
+                q,
+                kv,
+                kv,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,
+                csa_topk_idxs=csa_topk_idxs,
+                compressed_seq_len=compressed_seq_len,
+                **kwargs,
+            )
+        else:
+            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation, _eager_attention_with_sinks
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                q,
+                kv,
+                kv,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,
+                **kwargs,
+            )
 
         # K=V in V4, so V picked up RoPE on its trailing rope slice. Apply
         # the conjugate rotation (-sin) at the query position to undo it on
