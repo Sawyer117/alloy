@@ -1,17 +1,25 @@
-"""Integration test: ``alloy.integrations.hf_npu_binder`` bridge.
+"""Integration test: ``alloy.integrations.hf_npu_binder`` bridge —
+qwen3_5_moe family wiring.
 
-Verifies the bridge behaviour when the optional ``hf_npu_binder`` package is
-installed:
+Covers:
+  - The bridge import registers ``"triton"`` / ``"flash"`` impls under
+    every ``qwen3_5_gdn.*`` alloy key (chunk_rule / recurrent_rule /
+    causal_conv1d).
+  - The registered callables are byte-identical to the binder's symbols
+    (no copies / no wrappers) — so identity tests downstream are
+    meaningful.
+  - ``experts.flash`` is registered into HF's ``ALL_EXPERTS_FUNCTIONS``
+    table (the MoE experts forward is a whole-block dispatch, not split
+    into per-op alloy sub-functions; it doesn't go through alloy's
+    IMPL_REGISTRY).
+  - A subsequently-constructed ``Qwen35GatedDeltaNet`` routes its
+    sub-functions to the binder callables after ``activate``.
 
-  - The bridge import registers binder backends ("triton" / "flash") into
-    ``alloy.modules.registry.IMPL_REGISTRY`` under the canonical alloy keys.
-  - ``activate(model, prefer=...)`` writes the right ``_<key>_implementation``
-    fields on ``model.config``.
-  - A subsequently-constructed ``Qwen35GatedDeltaNet`` routes its sub-functions
-    to the binder callables, not alloy's torch defaults.
+Cross-cutting bridge tests (DEFAULTS broadcast, intent translation,
+binder-side hygiene) live in ``test_hf_npu_binder_bridge.py``.
 
-If ``hf_npu_binder`` is not installed, the whole file no-ops (printed SKIP) —
-the bridge is genuinely optional.
+If ``hf_npu_binder`` is not installed, the whole file no-ops (printed
+SKIP).
 
 Pure CPU torch.
 """
@@ -25,16 +33,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 try:
     import hf_npu_binder  # noqa: F401  -- bridge dep; bail out below if absent
 except ImportError:
-    print("SKIP — hf_npu_binder not installed; bridge integration not exercised.")
+    print("SKIP — hf_npu_binder not installed; qwen3_5_moe wiring not exercised.")
     sys.exit(0)
 
 from alloy import AlloyConfig
 from alloy.modules.attention.qwen3_5_gdn import Qwen35GatedDeltaNet
-from alloy.modules.registry import list_implementations
+from alloy.modules.registry import get_implementation, list_implementations
 from transformers.integrations.moe import ALL_EXPERTS_FUNCTIONS
 
 # Importing the bridge has the side effect of registering binder backends.
-import alloy.integrations.hf_npu_binder as bridge
+import alloy.integrations.hf_npu_binder as bridge  # noqa: F401
 from hf_npu_binder.qwen3_5_moe import (
     causal_conv1d as _hf_causal_conv1d,
     chunk_gated_delta_rule as _hf_chunk_gdr,
@@ -44,6 +52,10 @@ from hf_npu_binder.qwen3_5_moe import (
 
 
 def _gdn_config(**override) -> AlloyConfig:
+    """A minimal AlloyConfig sufficient to construct ``Qwen35GatedDeltaNet``.
+    GDN reads its sub-function impl handles from ``config._qwen3_5_gdn_implementation``
+    at ``__init__``, so we need a real AlloyConfig instance with those
+    attribute setters working."""
     cfg = AlloyConfig(
         vocab_size=128,
         hidden_size=64,
@@ -85,67 +97,12 @@ def test_bridge_callables_are_binder_originals() -> None:
     """The registered callables must be exactly the binder's symbols — not
     copies, not wrappers — so identity tests downstream are meaningful.
     """
-    from alloy.modules.registry import get_implementation
-
     assert get_implementation("qwen3_5_gdn.chunk_rule", "triton") is _hf_chunk_gdr.triton
     assert get_implementation("qwen3_5_gdn.chunk_rule", "flash")  is _hf_chunk_gdr.flash
     assert get_implementation("qwen3_5_gdn.recurrent_rule", "triton") is _hf_recurrent_gdr.triton
     assert get_implementation("qwen3_5_gdn.recurrent_rule", "flash")  is _hf_recurrent_gdr.flash
     assert get_implementation("qwen3_5_gdn.causal_conv1d", "triton") is _hf_causal_conv1d.triton
     assert get_implementation("qwen3_5_gdn.causal_conv1d", "flash")  is _hf_causal_conv1d.flash
-
-
-def test_activate_broadcast() -> None:
-    """String-broadcast resolves each operator's intent via
-    ``hf_npu_binder.DEFAULTS``, NOT a naive same-string set. Operators
-    without a kernel for the requested intent are translated to a
-    working fallback in their DEFAULTS entry.
-
-    Today's DEFAULTS:
-      - qwen3_5_moe.chunk_gated_delta_rule + experts both ship "flash",
-        so an intent of ``"flash"`` lands literally.
-      - deepseek_v4.sparse_flash_attention has no triton/flash port yet,
-        so every intent in its DEFAULTS entry maps to ``"torch"``.
-    """
-    cfg = _gdn_config()
-    model = type("FakeModel", (), {"config": cfg})()
-    chosen = bridge.activate(model, prefer="flash")
-    expected = {
-        "_qwen3_5_gdn_implementation": "flash",
-        "_experts_implementation":     "flash",
-        "_dsv4_csa_implementation":    "torch",  # SFA kernel port pending
-    }
-    assert chosen == expected, chosen
-    assert getattr(cfg, "_qwen3_5_gdn_implementation") == "flash"
-    assert getattr(cfg, "_experts_implementation") == "flash"
-    assert getattr(cfg, "_dsv4_csa_implementation") == "torch"
-
-
-def test_activate_auto_per_operator_recommendation() -> None:
-    """``activate(model, "auto")`` consults each operator's recommended
-    impl from ``hf_npu_binder.DEFAULTS`` — never blindly broadcasts
-    "auto" as a literal string (which would never resolve in
-    ``IMPL_REGISTRY``)."""
-    cfg = _gdn_config()
-    model = type("FakeModel", (), {"config": cfg})()
-    chosen = bridge.activate(model, prefer="auto")
-    # Each value must be an actual impl name registered in IMPL_REGISTRY,
-    # not the literal "auto".
-    assert "auto" not in chosen.values(), chosen
-    # GDN's current auto is triton; experts' is flash; SFA's is torch
-    # (kernel port pending). Update this expectation if binder's
-    # DEFAULTS changes.
-    assert chosen["_qwen3_5_gdn_implementation"] == "triton"
-    assert chosen["_experts_implementation"] == "flash"
-    assert chosen["_dsv4_csa_implementation"] == "torch"
-
-
-def test_activate_explicit_mapping_with_bare_module_key() -> None:
-    cfg = _gdn_config()
-    model = type("FakeModel", (), {"config": cfg})()
-    chosen = bridge.activate(model, prefer={"qwen3_5_gdn": "triton"})
-    assert chosen == {"_qwen3_5_gdn_implementation": "triton"}
-    assert getattr(cfg, "_qwen3_5_gdn_implementation") == "triton"
 
 
 def test_bridge_registers_experts_into_hf_table() -> None:
@@ -173,28 +130,11 @@ def test_constructed_layer_routes_to_binder() -> None:
     assert layer._causal_conv1d_fn   is _hf_causal_conv1d.flash
 
 
-def test_no_alloy_dep_inside_binder() -> None:
-    """The binder import path must remain alloy-unaware — only the bridge
-    knows alloy. Quick sanity check: the binder's top-level package
-    namespace doesn't expose any 'register_implementation' or 'IMPL_REGISTRY'.
-    """
-    import hf_npu_binder as binder
-    assert not hasattr(binder, "register_implementation"), (
-        "binder should not surface alloy's register_implementation"
-    )
-    assert not hasattr(binder, "IMPL_REGISTRY"), (
-        "binder should not surface alloy's IMPL_REGISTRY"
-    )
-
-
 _TESTS = [
     test_bridge_registers_triton_and_flash,
     test_bridge_callables_are_binder_originals,
     test_bridge_registers_experts_into_hf_table,
-    test_activate_broadcast,
-    test_activate_explicit_mapping_with_bare_module_key,
     test_constructed_layer_routes_to_binder,
-    test_no_alloy_dep_inside_binder,
 ]
 
 
@@ -213,7 +153,7 @@ def main() -> int:
     if failed:
         print(f"\n{failed}/{len(_TESTS)} test(s) failed.")
         return 1
-    print(f"\nAll {len(_TESTS)} bridge tests passed.")
+    print(f"\nAll {len(_TESTS)} qwen3_5_moe wiring tests passed.")
     return 0
 
 
