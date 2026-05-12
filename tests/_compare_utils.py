@@ -125,16 +125,27 @@ def alloy_config_from_qwen3_5_text(q35_text_cfg) -> AlloyConfig:
 
 
 def diff_logits(ref: torch.Tensor, ours: torch.Tensor) -> dict[str, float]:
-    """Pointwise absolute / relative diff stats between two logits tensors."""
+    """Pointwise absolute / relative diff stats between two logits tensors.
+
+    ``relative_max`` (worst-position drift / largest reference value) is
+    sensitive to outliers — one logit with a tiny ref but large diff
+    will dominate. ``relative_mean`` (mean drift / mean reference
+    magnitude) is the bulk noise-floor indicator; in bf16 we typically
+    expect it in the ~1e-3 envelope when the impls are math-equivalent.
+    """
     ref = ref.to(torch.float32)
     ours = ours.to(torch.float32)
     diff = (ref - ours).abs()
-    ref_abs_max = ref.abs().max().clamp_min(1e-12)
+    ref_abs = ref.abs()
+    ref_abs_max = ref_abs.max().clamp_min(1e-12)
+    ref_abs_mean = ref_abs.mean().clamp_min(1e-12)
     return {
         "max_abs": diff.max().item(),
         "mean_abs": diff.mean().item(),
-        "max_ref_abs": ref.abs().max().item(),
+        "max_ref_abs": ref_abs.max().item(),
+        "mean_ref_abs": ref_abs.mean().item(),
         "relative_max": (diff.max() / ref_abs_max).item(),
+        "relative_mean": (diff.mean() / ref_abs_mean).item(),
     }
 
 
