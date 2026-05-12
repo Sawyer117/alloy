@@ -28,6 +28,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 
@@ -213,7 +214,12 @@ def main() -> int:
     # -------------------------------------------------------------------------
     # Build B: binder triton CSA, identical weights.
     # -------------------------------------------------------------------------
-    cfg_b = AlloyConfig(**{k: v for k, v in cfg.to_dict().items()})
+    # deepcopy so underscore-prefixed runtime hints (especially
+    # _attn_implementation) carry over — to_dict() filters them by design,
+    # which would otherwise let cfg_b's HCA/sliding layers fall back to
+    # HF's auto-detected attn impl (often sdpa, no sinks) and diverge from
+    # the cfg-built model from layer 0.
+    cfg_b = copy.deepcopy(cfg)
     fake = type("Model", (), {"config": cfg_b})()
     chosen = binder.activate(fake, prefer={"dsv4_csa": "triton"})
     print(f"\n[B] activate() set: {chosen}")

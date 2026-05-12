@@ -41,6 +41,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 import time
 from pathlib import Path
@@ -274,7 +275,14 @@ def main() -> int:
     # =========================================================================
     print("\n" + "=" * 70)
     print(f"[binder]   activating prefer={args.prefer!r}")
-    cfg_b = AlloyConfig(**cfg.to_dict())
+    # deepcopy so _attn_implementation (and any other underscore-prefixed
+    # runtime hint) survives — AlloyConfig.to_dict() drops underscore fields
+    # by design (so they don't leak into config.json), but for within-process
+    # cloning we WANT them: stripping _attn_implementation makes cfg_b's
+    # HCA/sliding layers default to whatever HF auto-picks (often sdpa,
+    # which doesn't honour DSV4's sinks kwarg), so layer-0 already diverges
+    # from cfg before the CSA layer is reached.
+    cfg_b = copy.deepcopy(cfg)
     fake = type("Model", (), {"config": cfg_b})()
     # Use the mapping form so we only touch the dsv4_csa surface. The
     # string-broadcast form would also flip _qwen3_5_gdn_implementation
