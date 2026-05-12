@@ -237,7 +237,10 @@ def main() -> int:
     print(f"CSA layers in this run: {csa_layers}/{args.num_layers}")
 
     torch.manual_seed(args.seed)
-    input_ids = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len), device=device)
+    # Generate on CPU then move — some CANN releases route a direct
+    # ``torch.randint(..., device='npu')`` through ``aclnnInplaceRandom``
+    # whose dynamic kernel config fails to parse on older toolkits.
+    input_ids = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len)).to(device)
 
     # =========================================================================
     # Phase 1: BASELINE — alloy default ('torch' dispatch)
