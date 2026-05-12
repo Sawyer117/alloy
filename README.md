@@ -2,117 +2,134 @@
 
 # 🧪 Alloy
 
-**A HuggingFace-native library for composing hybrid transformer architectures, layer by layer.**
+**HuggingFace-native hybrid transformer composition with built-in roofline analysis.**
 
-Mix grouped-query attention, gated DeltaNet, MoE, and dense MLP in arbitrary proportions — the architecture is fully described by two ordered lists, `layer_types` and `ffn_types`, no forking or `modeling_*.py` rewrites required.
+Define hybrid architectures by config. Load real HF checkpoints. Analyze theoretical
+performance. One library, three pillars.
 
-[Updates](#-updates) • [Why Alloy](#-why-alloy) • [How it works](#-how-it-works) • [Quick start](#-quick-start) • [Training](#-training) • [Built-in modules](#-built-in-modules) • [Testing](#-testing) • [Roadmap](#-roadmap)
+[Quick start](#-quick-start) • [Three pillars](#-three-pillars) • [Built-in modules](#-built-in-modules) • [Project layout](#-project-layout) • [Testing](#-testing)
 
 </div>
 
 ---
 
-## ✨ Updates
+## ✨ Three pillars
 
-- **[2026-04-27]** 🪄 NPU edition of the pretrained-weight comparison scripts — `torch_npu` + `transfer_to_npu` wired in, qwen3.5-MoE script supports `--num-layers N` truncation for memory-constrained Ascend cards.
-- **[2026-04-27]** 🏷️ Source-coupled module naming. Registry keys now carry their upstream model in the name (`qwen3_mlp`, `qwen3_attention`, `qwen3_5_moe`, `qwen3_5_gdn`) so a future `bert_mlp` (GELU, no gate) can coexist with the qwen3-derived SwiGLU without colliding. Mask routing moves to a declared `mask_kind` on `MixerEntry` so adding a new mixer no longer requires editing `modeling_alloy.py`.
-- **[2026-04-24]** 🧬 GDN + MoE hybrid config example landed for Qwen3.5-35B-A3B.
-- **[2026-04-24]** 📦 Loading helpers (`build_skeleton`, `build_on_device`, `load_state_dict_from_disk`, `strip_language_model_prefix`) promoted to public alloy API; HF MoE expert dispatch routed through `transformers.integrations.moe`.
-- **[2026-04-24]** 🚀 First end-to-end Qwen3 / Qwen3.5-MoE equivalence demos. Under fp32 eager, small-scale random-init `AlloyForCausalLM` matches `Qwen3ForCausalLM` with `max_abs = 0.0` — bit-exact.
+### 1. 🧩 Composable by config, not code
 
-## 💡 Why Alloy
-
-Modern language-model research increasingly explores *hybrid* architectures — alternating softmax attention with linear-time token mixers (DeltaNet, Mamba, RWKV), interleaving dense and MoE layers, tuning attention configuration per depth. Today, each new recipe either requires forking a heavyweight trainer (torchtitan, Megatron-Core) or shipping bespoke `modeling_*.py` files that fragment HuggingFace interoperability.
-
-Alloy takes a different stance:
-
-- 🤗 **HuggingFace-native end-to-end.** Models are plain `PreTrainedModel` subclasses backed by `PretrainedConfig`. They integrate with `from_pretrained`, `save_pretrained`, `generate`, Trainer, Accelerate, PEFT, and any FSDP2-based backend out of the box.
-- 🧩 **Composition by config, not by code.** A model's architecture is fully determined by two ordered lists — `layer_types` (token mixer per depth) and `ffn_types` (feed-forward per depth). Changing the architectural mix is a JSON edit.
-- 🔌 **Extension without forking.** New token mixers and feed-forward blocks register themselves through a lightweight decorator. The core decoder layer stays agnostic of which mixer you plug in.
-- 🖥️ **Cross-hardware by design.** Model code carries no `torch_npu` / CUDA-specific imports. Hardware-specific fused kernels are layered on as opt-in runtime patches, so the same model definition runs unchanged on GPU and NPU.
-
-Target use cases: architecture research (systematic layer-mix ablations, novel attention variants), hybrid-architecture pretraining and fine-tuning, and portable model definitions that survive the move between GPU training and NPU-optimized deployment.
-
-## 🧱 How it works
-
-The core abstraction is a decoder layer whose components are looked up in a registry at construction time:
+A model's architecture is fully described by two ordered lists: `layer_types` (token
+mixer per depth) and `ffn_types` (feed-forward per depth). Mix softmax attention
+with linear attention, dense with MoE, sliding with full attention, in any pattern.
+**Switching architectures is a JSON edit** — no forking, no per-architecture
+`modeling_*.py` rewrites.
 
 ```python
-class AlloyDecoderLayer(nn.Module):
-    def __init__(self, config, layer_idx):
-        mixer_entry = get_mixer(config.layer_types[layer_idx])
-        setattr(self, mixer_entry.attr_name, mixer_entry.cls(config, layer_idx))
-        self.mlp = get_ffn(config.ffn_types[layer_idx])(config, layer_idx)
-        ...
+from alloy import AlloyConfig, AlloyForCausalLM
+
+config = AlloyConfig(
+    vocab_size=32000, hidden_size=2048, num_hidden_layers=16,
+    num_attention_heads=16, num_key_value_heads=2, head_dim=128, intermediate_size=8192,
+    layer_types=["qwen3_5_gdn", "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_attention"] * 4,
+    ffn_types=["qwen3_mlp"] * 16,
+)
+model = AlloyForCausalLM(config)
 ```
 
-- `config.layer_types[i]` names the token mixer at layer `i`; `config.ffn_types[i]` names the feed-forward block.
-- `MIXER_REGISTRY` and `FFN_REGISTRY` (in `alloy.modules.registry`) map those strings to `nn.Module` classes. Each mixer entry also declares a `mask_kind` (`"causal"`, `"sliding"`, or `"linear"`) that the model-level mask precompute uses to dispatch the right mask family — adding a new mixer never requires editing `modeling_alloy.py`.
-- Sub-module attribute names (`self_attn`, `linear_attn`, `mlp`) match the conventions HuggingFace reference implementations use, so checkpoint `state_dict` keys line up without rewriting.
-- Each mixer reads only the config fields it cares about; the config is a single flat bag of hyperparameters covering every registered module.
-- The forward path pre-computes all needed masks once at the model level (causal, sliding-window, linear) and passes everything downward as `**kwargs`; each mixer picks what it needs and ignores the rest.
+Adding a new mixer is a decorator and one line in your config:
 
-## 📁 Project layout
+```python
+from alloy.modules.registry import register_mixer
+
+@register_mixer("my_rwkv", attr_name="linear_attn", mask_kind="linear")
+class MyRWKV(nn.Module):
+    ...
+
+config = AlloyConfig(..., layer_types=["my_rwkv"] * 8 + ["qwen3_attention"] * 8, ...)
+```
+
+The core decoder layer never knew this mixer existed; no PR to alloy required.
+Mask routing follows the declared `mask_kind` (`"causal"` / `"sliding"` / `"linear"`),
+so model-level mask precompute stays generic.
+
+### 2. 🤗 HuggingFace-native end-to-end
+
+Models are plain `PreTrainedModel` subclasses backed by `PretrainedConfig`. They
+integrate with `from_pretrained`, `save_pretrained`, `generate`, Trainer,
+Accelerate, PEFT, and any FSDP2-based backend out of the box. **Parameter names
+match HF qwen3 / qwen3.5 checkpoints exactly** — Hub weights load with
+`load_state_dict(strict=False)` and run bit-exact under fp32 eager
+(`max_abs = 0.0` verified end-to-end).
+
+```python
+from transformers import AutoModelForCausalLM
+hf = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-4B")
+
+alloy = AlloyForCausalLM(alloy_config_from_qwen3(hf.config))
+alloy.load_state_dict(hf.state_dict(), strict=False)
+# generate(), save_pretrained(), Trainer, etc. all work as expected
+```
+
+Hardware portability is part of the same story: `modeling_alloy.py` and
+`modules/**` carry zero `torch_npu` / CUDA-specific imports. NPU fast-path
+kernels (triton / flash) layer on as opt-in runtime patches via the
+`hf-npu-binder` bridge — same model definition, same checkpoint, runs on
+both GPU and Ascend NPU.
+
+### 3. 📐 Roofline modeling per architecture
+
+`alloy.roofline` computes theoretical FLOPs and HBM bytes for one forward pass —
+**purely analytical, config-driven, no model construction**. Handles
+10T-parameter configs in O(num_layers) time. Three modes
+(prefill / mini-prefill / decode), four hardware presets
+(A100 / H100 / Ascend910B1 / Ascend910C) plus `CustomHardware(...)` for
+chips not in the preset list, auto-scaled report.
+
+```python
+from alloy.roofline import (
+    CustomHardware, roofline_prefill, roofline_mini_prefill, roofline_decode,
+)
+
+# Custom chip not in the preset list — build from kwargs (numbers are illustrative)
+my_device = CustomHardware(
+    name="my-device", hbm_bandwidth=8e12,
+    bf16=2250e12, fp32=80e12, fp8=4500e12,
+)
+
+# Print one full report to see the format
+print(roofline_prefill(config, batch=1, seq_len=4096, hardware="H100"))
+
+# Three modes (cold prefill / mini-prefill / decode) cover the serving pipeline.
+# Mix preset strings and CustomHardware instances freely.
+# FLOPs and bytes are config-determined; only timing changes per device.
+for hw in ["H100", "Ascend910C", my_device]:
+    p = roofline_prefill     (config, batch=1, seq_len=4096, hardware=hw)
+    m = roofline_mini_prefill(config, batch=1, chunk_len=512, kv_cache_len=2048, hardware=hw)
+    d = roofline_decode      (config, batch=1, kv_cache_len=4096, hardware=hw)
+    name = hw if isinstance(hw, str) else hw.name
+    print(f"{name:11}  prefill: {p.roofline_time_s*1e3:>5.2f} ms ({p.bottleneck:7})"
+          f"  mini: {m.roofline_time_s*1e3:>5.2f} ms ({m.bottleneck:7})"
+          f"  decode: {d.roofline_time_s*1e6:>4.0f} us ({d.bottleneck})")
+```
 
 ```
-alloy/
-├── configuration_alloy.py            # AlloyConfig(PretrainedConfig)
-├── modeling_alloy.py                 # AlloyDecoderLayer, AlloyModel, AlloyForCausalLM
-├── loading.py                        # build_skeleton / build_on_device / load_state_dict_from_disk
-├── modules/
-│   ├── registry.py                   # MIXER_REGISTRY, FFN_REGISTRY, decorators (with mask_kind)
-│   ├── attention/
-│   │   ├── qwen3_attention.py        # "qwen3_attention", "qwen3_attention_sliding"  → Qwen3Attention
-│   │   └── qwen3_5_gdn.py             # "qwen3_5_gdn"                                 → Qwen35GatedDeltaNet
-│   ├── ffn/
-│   │   ├── qwen3_mlp.py               # "qwen3_mlp"                                   → Qwen3MLP (SwiGLU)
-│   │   └── qwen3_5_moe.py             # "qwen3_5_moe"                                 → Qwen35SparseMoE
-│   └── shared/
-│       ├── norm.py                   # RMSNorm with unit_offset flag
-│       ├── rotary.py                 # RoPE with partial + interleaved-mRoPE support
-│       └── attention_kernels.py      # eager_attention_forward, repeat_kv
-├── integrations/
-│   ├── hf_npu_binder.py              # Bridge to hf-npu-binder (registers triton/flash kernels)
-│   └── mindspeed_mm.py                # Bridge to MindSpeed-MM trainer (registers model_id="alloy")
-├── tools/
-│   └── export_for_hub.py              # Build a Hub-loadable dir: config.json + modeling shim + auto_map
-├── examples/
-│   ├── build_from_config.py          # JSON-driven model build + load + generate
-│   ├── build_from_python.py          # Programmatic model build + load + generate
-│   ├── package_config_for_hub.py     # Generate Hub-style model dir + (optional) copy tokenizer
-│   ├── configs/
-│   │   ├── qwen3_4b.json
-│   │   ├── qwen3_5_35b_a3b.json
-│   │   ├── qwen3_next_340m_dense.json
-│   │   └── qwen3_next_1_3b_dense.json
-│   └── train/
-│       ├── README_mindspeed_mm.md     # ★ Training workflow doc (start here)
-│       ├── pretrain_alloy_qwen3_dense_mindspeed.yaml      # qwen3 dense, no GDN no MoE
-│       ├── pretrain_alloy_qwen3_next_340m_mindspeed.yaml  # qwen3-next, GDN dense
-│       └── pretrain_alloy_qwen3_5_moe_mindspeed.yaml      # qwen3.5-MoE, GDN + MoE
-├── scripts/
-│   ├── compare_qwen3.py              # Small-scale Qwen3 equivalence demo
-│   └── compare_qwen3_5.py            # Small-scale Qwen3.5-MoE equivalence demo
-└── tests/
-    ├── _compare_utils.py             # Shared helpers (device/cache/streaming/diff)
-    ├── test_construct.py             # Hardware-agnostic smoke test
-    ├── test_impl_registry.py         # IMPL_REGISTRY (per-module fast-path dispatch)
-    ├── test_hf_npu_binder_integration.py   # Bridge end-to-end (skipped without binder)
-    ├── gpu/                          # CUDA pretrained-weight comparisons
-    │   ├── compare_qwen3_pretrained.py
-    │   └── compare_qwen3_5_pretrained.py
-    └── npu/                          # Ascend NPU comparisons (torch_npu + transfer_to_npu)
-        ├── compare_qwen3_pretrained.py
-        ├── compare_qwen3_5_pretrained.py
-        ├── compare_binder_vs_torch.py            # Speed + precision: binder ON vs OFF
-        ├── compare_training_step_vs_hf.py        # Speed + precision: alloy(±binder) vs HF reference
-        ├── run_compare_grid.sh                    # Sweep the validation grid (5 rows)
-        └── debug_layerwise_diff.py
+Roofline | H100-SXM5 | bf16 | prefill (B=1, Q=4096)
+------------------------------------------------------------------------------
+TOTAL: 10.18 TFLOPs / 3.77 GB / AI = 2703.7
+H100-SXM5: compute=10.30 ms, memory=1.12 ms -> bottleneck=compute (10.30 ms / forward)
+
+H100         prefill: 10.30 ms (compute)  mini:  1.26 ms (compute)  decode:  702 us (memory)
+Ascend910C   prefill: 13.43 ms (compute)  mini:  1.65 ms (compute)  decode:  735 us (memory)
+my-device    prefill:  4.53 ms (compute)  mini:  0.55 ms (compute)  decode:  294 us (memory)
 ```
+
+`CustomHardware(...)` accepts named-dtype kwargs (`int8` / `fp8` / `fp16` /
+`bf16` / `fp32` / `fp64` for the cube/tensor unit, `vector_*` for Ascend-style
+separate vector throughput), all in absolute FLOP/s. It returns a regular
+`Hardware` instance — pass it to `hardware=` anywhere a preset string works.
+
+---
 
 ## ⚡ Quick start
-
-### Installation
 
 ```bash
 pip install torch transformers safetensors
@@ -121,183 +138,131 @@ git clone https://github.com/Sawyer117/alloy
 # Put the parent directory on PYTHONPATH so `import alloy` works.
 ```
 
-### Build a hybrid model
-
-A 16-layer model alternating linear attention and full attention 3-to-1, with dense SwiGLU FFNs throughout:
+Build, load, analyze:
 
 ```python
 from alloy import AlloyConfig, AlloyForCausalLM
+from alloy.roofline import roofline_prefill
 
 config = AlloyConfig(
-    vocab_size=32000,
-    hidden_size=2048,
-    num_hidden_layers=16,
-    num_attention_heads=16,
-    num_key_value_heads=2,
-    head_dim=128,
-    intermediate_size=8192,
-    layer_types=[
-        "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_attention",
-    ] * 4,
+    vocab_size=32000, hidden_size=2048, num_hidden_layers=16,
+    num_attention_heads=16, num_key_value_heads=2, head_dim=128, intermediate_size=8192,
+    layer_types=["qwen3_5_gdn", "qwen3_5_gdn", "qwen3_5_gdn", "qwen3_attention"] * 4,
     ffn_types=["qwen3_mlp"] * 16,
 )
 model = AlloyForCausalLM(config)
+
+print(roofline_prefill(config, batch=1, seq_len=2048, hardware="A100"))
 ```
 
-Swap the FFN for MoE by changing one field:
+Two end-to-end demos in [`alloy/examples/`](alloy/examples/) load real
+Qwen3 / Qwen3.5-MoE weights and run greedy generation. For training, see
+**[`examples/train/README_mindspeed_mm.md`](examples/train/README_mindspeed_mm.md)** —
+yaml templates, data prep, launchers, and backend switching
+(`torch` / `triton` / `flash`) for the MindSpeed-MM FSDP2 workflow.
 
-```python
-config.ffn_types = ["qwen3_5_moe"] * 16
-config.num_experts = 128
-config.num_experts_per_tok = 8
-```
-
-Two end-to-end examples live under [`alloy/examples/`](alloy/examples/) — one driven by a JSON config, one constructed programmatically. Both load real Qwen3 / Qwen3.5-MoE weights and run greedy generation.
-
-### Register a custom mixer
-
-Drop a file somewhere importable and decorate a module class:
-
-```python
-from alloy.modules.registry import register_mixer
-
-@register_mixer("my_rwkv", attr_name="linear_attn", mask_kind="linear")
-class MyRWKV(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        ...
-
-    def forward(self, hidden_states, past_key_values=None, **kwargs):
-        ...
-```
-
-Then reference it by string in the config:
-
-```python
-config = AlloyConfig(..., layer_types=["my_rwkv"] * 8 + ["qwen3_attention"] * 8, ...)
-```
-
-`mask_kind` declares which mask the model-level precompute hands this layer (`"causal"`, `"sliding"`, or `"linear"`) — pick whichever matches your forward's expectations. Naming convention: `<source_model>_<kind>` when the implementation is materially copied from a specific upstream model. Alloy's core never knew this mixer existed, and no PR to the library is required to use it.
-
-## 🚂 Training
-
-Alloy plugs into MindSpeed-MM (FSDP2) via a thin plugin shim — `model_id: alloy` in the trainer yaml resolves to `AlloyForCausalLM` through `model_register`, the model directory loads via `AutoConfig.from_pretrained(..., trust_remote_code=True)`, and runtime fast-path dispatch (binder's triton / flash kernels) is selected per-yaml-field without code edits or model-dir regeneration.
-
-The full workflow lives at **[`alloy/examples/train/README_mindspeed_mm.md`](examples/train/README_mindspeed_mm.md)**:
-
-- **Quickstart table** picking the right yaml template based on whether your alloy config has GDN linear-attention layers and/or MoE feed-forward layers
-- **Concrete walkthrough** for a 340M qwen3-next-style dense model — from a `MindSpeed-LLM` `pretrain_*.sh` launcher's hyperparameters all the way to `bash my_launcher.sh`
-- **General workflow** for any custom alloy architecture (3 steps)
-- **Hyperparameter map** (`MBS` / `GBS` / `LR` / `TRAIN_ITERS` / ... → yaml fields)
-- **Switching backends without retraining** (yaml flips `_qwen3_5_gdn_implementation` / `_experts_implementation` between `torch` / `triton` / `flash`)
-- **FSDP plan caveats** for alloy's module path layout (`model.layers.{*}.linear_attn` etc.)
-- **Troubleshooting** for plugin / dispatch / transformers-fork issues
-
-The core recipe in three commands:
-
-```bash
-# 1. Generate the Hub-style model directory + copy tokenizer
-python -m alloy.examples.package_config_for_hub \
-    --config alloy/examples/configs/qwen3_next_340m_dense.json \
-    --target ./hf_models/alloy_qwen3_next_340m \
-    --tokenizer-src /path/to/your/tokenizer/dir
-
-# 2. Pick a yaml template, edit the data + save paths
-cp alloy/examples/train/pretrain_alloy_qwen3_next_340m_mindspeed.yaml \
-   /path/to/scripts/configs/my_run.yaml
-# ...edit my_run.yaml: dataset_dir / dataset / save / etc.
-
-# 3. Launch via the standard MindSpeed-MM trainer
-torchrun $DISTRIBUTED_ARGS mindspeed_mm/fsdp/train/trainer.py \
-    /path/to/scripts/configs/my_run.yaml
-```
+---
 
 ## 🔌 Built-in modules
 
-| Registry key                | Class                  | Source            | mask_kind  | Notes                                                                            |
-|-----------------------------|------------------------|-------------------|------------|----------------------------------------------------------------------------------|
-| `qwen3_attention`           | `Qwen3Attention`       | qwen3 / qwen3.5   | `causal`   | Softmax GQA. `attn_output_gate=True` reproduces qwen3.5 gated output projection. |
-| `qwen3_attention_sliding`   | `Qwen3Attention`       | qwen3 / qwen3.5   | `sliding`  | Same class, `config.sliding_window` controls window mask at the model level.     |
-| `qwen3_5_gdn`               | `Qwen35GatedDeltaNet`  | qwen3.5           | `linear`   | Chunked + recurrent delta-rule kernels, torch fallback when `fla` unavailable.   |
-| `qwen3_mlp`                 | `Qwen3MLP`             | qwen3 / qwen3.5   | n/a        | SwiGLU MLP matching qwen3 / llama parameter names.                               |
-| `qwen3_5_moe`               | `Qwen35SparseMoE`      | qwen3.5           | n/a        | Top-K router, grouped experts (3D weight tensors), gated shared expert.          |
+| Registry key                | Family            | Source            | Notes                                              |
+|-----------------------------|-------------------|-------------------|----------------------------------------------------|
+| `qwen3_attention`           | mixer             | qwen3 / qwen3.5   | Causal MHA + GQA, optional `attn_output_gate`      |
+| `qwen3_attention_sliding`   | mixer             | qwen3 / qwen3.5   | Sliding-window variant of the above                |
+| `qwen3_5_gdn`               | mixer (linear)    | qwen3.5           | Gated DeltaNet, chunk + fused recurrent kernels    |
+| `dsv4_sliding_attention`    | mixer             | DeepSeek V4       | Sliding window, MQA, per-head sinks                |
+| `dsv4_hca_attention`        | mixer             | DeepSeek V4       | Heavy compressed attention (128:1)                 |
+| `dsv4_csa_attention`        | mixer             | DeepSeek V4       | Compressed sparse attention + Lightning Indexer    |
+| `qwen3_mlp`                 | ffn               | qwen3 / qwen3.5   | SwiGLU MLP                                         |
+| `qwen3_5_moe`               | ffn (sparse)      | qwen3.5           | TopK router + gated shared expert                  |
+| `dsv4_moe`                  | ffn (sparse)      | DeepSeek V4       | TopK router + always-on shared expert              |
+| `dsv4_hash_moe`             | ffn (sparse)      | DeepSeek V4       | Hash routing via `tid2eid` lookup                  |
 
-Shared primitives used across mixers:
+All entries have paired `RooflineSpec`s registered. Shared primitives
+(`RMSNorm`, `RotaryEmbedding`, `eager_attention_forward`) cover both qwen3
+(`w * x`, full rotary) and qwen3.5 (`(1 + w) * x`, partial + interleaved mRoPE)
+conventions from a single class via flag-driven dispatch.
 
-- **`RMSNorm`** — parameterized to cover both qwen3 (`w * x`, `ones_` init) and qwen3.5 (`(1 + w) * x`, `zeros_` init) styles via an `unit_offset` flag.
-- **`RotaryEmbedding`** — supports partial rotary (`partial_rotary_factor`) and interleaved mRoPE (`mrope_section`), covering qwen3 and qwen3.5 RoPE conventions from a single class.
-- **`eager_attention_forward`** — HF-style eager kernel used as fallback; `ALL_ATTENTION_FUNCTIONS.get_interface` routes SDPA / flash-attention automatically when `config._attn_implementation` is set accordingly.
+---
 
-## 🔁 Loading HuggingFace checkpoints
+## 📁 Project layout
 
-Parameter names match HuggingFace qwen3 / qwen3.5 exactly (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `q_norm`, `k_norm`, `gate_proj`, `up_proj`, `down_proj`, `conv1d`, `in_proj_qkv`, `in_proj_z`, `in_proj_b`, `in_proj_a`, `out_proj`, `A_log`, `dt_bias`, `norm`, `experts.gate_up_proj`, `experts.down_proj`, `shared_expert.*`, `shared_expert_gate`). HuggingFace Hub checkpoints load with a plain `load_state_dict(strict=False)` given the right config flags:
-
-| Target checkpoint   | Key config flags                                                                                       |
-|---------------------|--------------------------------------------------------------------------------------------------------|
-| qwen3 family        | `attn_output_gate=False`, `rms_norm_unit_offset=False`, `ffn_types=["qwen3_mlp"]*N`                    |
-| qwen3.5-MoE family  | `attn_output_gate=True`, `rms_norm_unit_offset=True`, `ffn_types=["qwen3_5_moe"]*N`, partial + mRoPE   |
-
-HF's canonical `layer_types` strings (`"full_attention"`, `"sliding_attention"`, `"linear_attention"`) translate via `alloy.configuration_alloy.hf_layer_types_to_alloy` into alloy's vocabulary. The helpers `alloy_config_from_qwen3` and `alloy_config_from_qwen3_5_text` (in [`alloy/tests/_compare_utils.py`](alloy/tests/_compare_utils.py)) wrap the full HF→alloy config translation.
-
-## 🖥️ Hardware abstraction
-
-Model code in `modeling_alloy.py` and `modules/**` has zero hardware-specific imports. Hardware optimizations are layered on top as opt-in patches:
-
-```python
-# (planned) alloy.npu_patch
-from alloy.npu_patch import transform_for_npu
-
-model = AlloyForCausalLM(config)
-if device.type == "npu":
-    transform_for_npu(model)   # swap RMSNorm / attention / rope / fused kernels
+```
+alloy/
+├── configuration_alloy.py            # AlloyConfig(PretrainedConfig)
+├── modeling_alloy.py                 # AlloyDecoderLayer, AlloyModel, AlloyForCausalLM
+├── loading.py                        # build_skeleton / build_on_device / state_dict streaming
+├── modules/
+│   ├── registry.py                   # MIXER_REGISTRY, FFN_REGISTRY (mask_kind, decorators)
+│   ├── attention/                    # qwen3_attention, qwen3_5_gdn, dsv4_attention
+│   ├── ffn/                          # qwen3_mlp, qwen3_5_moe, dsv4_moe
+│   └── shared/                       # norm, rotary, attention_kernels
+├── roofline/                         # ★ analytical FLOPs / bytes / arithmetic intensity
+│   ├── analyze.py                    # roofline / roofline_prefill / _mini_prefill / _decode
+│   ├── specs.py                      # RooflineSpec ABC + LinearSpec + RMSNormSpec
+│   ├── specs_attention.py            # Qwen3AttentionSpec, DSV4AttentionSpec
+│   ├── specs_ffn.py                  # SwiGLUMLPSpec, DSV4MoESpec, Qwen35MoESpec
+│   ├── specs_gdn.py                  # Qwen35GDNSpec (chunk + fused_recurrent dispatch)
+│   └── hardware.py                   # A100 / H100 / Ascend910B1 / Ascend910C presets
+├── integrations/                     # hf_npu_binder, mindspeed_mm bridges
+├── tools/                            # export_for_hub
+├── examples/                         # configs/, train/, build_*.py demos
+├── scripts/                          # compare_*.py equivalence demos
+└── tests/                            # construct + gpu/ + npu/ + 6 roofline suites
 ```
 
-The same `AlloyForCausalLM(config)` runs on GPU (no patch, pure PyTorch) and on NPU (with patch, calling `torch_npu.npu_fusion_attention`, `torch_npu.npu_rms_norm`, etc.). Model definitions stay portable and research stays reproducible across hardware.
+---
 
 ## 🧪 Testing
 
 ```bash
-# Hardware-agnostic construction + forward-shape smoke test
+# Roofline analytics — 63 hand-computed tests, 6 suites
+python -m alloy.tests.test_roofline_smoke
+python -m alloy.tests.test_roofline_modes
+python -m alloy.tests.test_roofline_attention_specs
+python -m alloy.tests.test_roofline_qwen3_attn_specs
+python -m alloy.tests.test_roofline_gdn_specs
+python -m alloy.tests.test_roofline_ffn_specs
+
+# Construction smoke (hardware-agnostic)
 python -m alloy.tests.test_construct
 
-# CUDA: load real pretrained weights, diff forward + greedy tokens against HF
+# CUDA: real Qwen3 weights vs HF reference (max_abs, max relative, token-id equality)
 python -m alloy.tests.gpu.compare_qwen3_pretrained --pretrained Qwen/Qwen3-4B --dtype bf16
-python -m alloy.tests.gpu.compare_qwen3_5_pretrained --pretrained /path/to/Qwen3.5-35B-A3B --dtype bf16
 
-# Ascend NPU: same protocol, requires torch_npu installed
-python -m alloy.tests.npu.compare_qwen3_pretrained --pretrained Qwen/Qwen3-4B --dtype bf16
-python -m alloy.tests.npu.compare_qwen3_5_pretrained --pretrained /path/to/Qwen3.5-35B-A3B --dtype bf16 --num-layers 4
+# Ascend NPU: same protocol, torch_npu auto-redirected; --num-layers N for memory-bound cards
+python -m alloy.tests.npu.compare_qwen3_5_pretrained \
+    --pretrained /path/to/Qwen3.5-35B-A3B --dtype bf16 --num-layers 4
 ```
 
-The pretrained-weight tests (CUDA and NPU) follow the same sequential protocol to avoid holding two copies of weights simultaneously:
+Pretrained-weight comparisons run sequentially (HF reference forward → save logits +
+token ids → release HBM → build alloy → stream weights from on-disk safetensors →
+compare) so a single 80 GB card holds at most one model copy. Generated token ids
+must match exactly (`torch.equal`); fp32 eager achieves `max_abs = 0.0` end-to-end.
 
-1. Load the HF reference model, run forward + greedy generation on a fixed prompt, save CPU logits and generated token ids, release the model from HBM.
-2. Construct the equivalent `AlloyForCausalLM`, stream the state dict directly from the on-disk safetensors shards, run the identical forward + generation.
-3. Compare. Generated token ids must match exactly (`torch.equal`); logits diff statistics (`max_abs`, `mean_abs`, `relative_max`) provide a finer diagnostic.
-
-The NPU scripts add two top-level imports — `import torch_npu` and `from torch_npu.contrib import transfer_to_npu` — so any HF-internal `torch.cuda.*` / `.cuda()` call is monkey-patched to the NPU backend. Both reference and ours run on `attn_implementation="eager"`, so the only place math can drift is the elementwise + matmul kernels themselves; default tolerances on NPU therefore match the CUDA script.
-
-The qwen3.5-MoE NPU script additionally takes `--num-layers N` (default 4) and truncates *both* the HF reference and the alloy model to their first N layers, loading only those layers' weights from the on-disk safetensors. Qwen3.5-35B-A3B in bf16 is ~70 GB and does not fit on a single Ascend 910B-class card; the truncated comparison still exercises GDN, gated GQA, the shared expert, the top-K router, the grouped experts, partial RoPE, and unit-offset RMSNorm, because the first 4 layers cover the canonical 3:1 GDN:full-attention pattern.
-
-Under fp32 eager mode the small-scale random-init comparison against `Qwen3ForCausalLM` produces `max_abs = 0.0` — bit-exact equivalence.
+---
 
 ## 🚧 Known limitations
 
-- **Incremental decoding for linear attention.** `Qwen35GatedDeltaNet` expects a `HybridCache` exposing `update_conv_state` / `update_recurrent_state`. Generation with `DynamicCache` falls back to full re-forward per new token (`use_cache=False`). A proper hybrid-cache implementation is on the roadmap.
-- **NPU patch layer.** `alloy.npu_patch` is scoped and not yet implemented in this initial scaffolding.
-- **MoE expert dispatch.** The fallback eager path is a batched-bmm forward; on `transformers` v5 the class is wrapped by `@use_experts_implementation` and routes through `grouped_mm` / `batched_mm` automatically. The fallback is correct but not tuned for very large expert counts.
+- **Incremental decoding for linear attention.** `Qwen35GatedDeltaNet` expects a
+  `HybridCache`. Generation with `DynamicCache` falls back to full re-forward per
+  new token (`use_cache=False`).
+- **NPU fused-kernel patch** is provided via `hf-npu-binder`; the in-tree
+  `alloy.npu_patch` placeholder is not yet implemented.
+- **Roofline read/write split.** Bytes are aggregated into one HBM-traffic number
+  (correct under the shared-bus model). Per-direction breakdown is on the v2
+  list.
 
-## 🗺️ Roadmap
-
-- `HybridCache` for incremental generation with heterogeneous mixer types.
-- `alloy.npu_patch`: runtime patch set that swaps `RMSNorm`, `apply_rotary_pos_emb`, softmax attention, and grouped expert paths for `torch_npu` fused kernels.
-- Additional registered mixers: Mamba2, MLA (Multi-head Latent Attention), RWKV variants.
-- Integration recipes for MindSpeed-LLM's FSDP2 training path (native HF `AutoModelForCausalLM` consumer).
-- Sliding-window KV cache path for long-context training / inference.
+---
 
 ## 🤝 Acknowledgements
 
-The `Qwen3Attention`, `Qwen35GatedDeltaNet`, and `Qwen35SparseMoE` implementations are ported from HuggingFace `transformers` (`modeling_qwen3.py`, `modeling_qwen3_5_moe.py`), preserving math and parameter names so upstream checkpoints load without modification. The registry-based decoder-layer pattern is inspired by HuggingFace's canonical hybrid decoder layout, and the README structure follows the lead of [`fla-org/flash-linear-attention`](https://github.com/fla-org/flash-linear-attention).
+`Qwen3Attention`, `Qwen35GatedDeltaNet`, `Qwen35SparseMoE`, and the DSV4 attention
+and MoE blocks are ports of HuggingFace `transformers` reference implementations,
+preserving math and parameter names so upstream checkpoints load without
+modification. The registry-based decoder-layer pattern follows HuggingFace's
+canonical hybrid decoder layout. README structure follows
+[`fla-org/flash-linear-attention`](https://github.com/fla-org/flash-linear-attention).
 
 ## 📄 License
 
