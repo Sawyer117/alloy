@@ -268,7 +268,12 @@ def main() -> int:
     print(f"[binder]   activating prefer={args.prefer!r}")
     cfg_b = AlloyConfig(**cfg.to_dict())
     fake = type("Model", (), {"config": cfg_b})()
-    chosen = binder.activate(fake, prefer=args.prefer)
+    # Use the mapping form so we only touch the dsv4_csa surface. The
+    # string-broadcast form would also flip _qwen3_5_gdn_implementation
+    # and _experts_implementation (neither relevant for this DSV4 model;
+    # the experts flip in particular is the one that has caused HF's
+    # _check_and_adjust_experts_implementation to reject the value).
+    chosen = binder.activate(fake, prefer={"dsv4_csa": args.prefer})
     print(f"[binder]   activate() set: {chosen}")
 
     torch.manual_seed(args.seed)
