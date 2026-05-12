@@ -148,6 +148,18 @@ class RooflineReport:
         return max(self.compute_time_s, self.memory_time_s)
 
     @property
+    def tokens_per_sec(self) -> float:
+        """Throughput: query tokens processed this forward / forward time."""
+        n = self.batch * self.query_len
+        return n / self.roofline_time_s if self.roofline_time_s > 0 else 0.0
+
+    @property
+    def time_per_token_s(self) -> float:
+        """Inverse of :attr:`tokens_per_sec` — forward time per token."""
+        n = self.batch * self.query_len
+        return self.roofline_time_s / n if n > 0 else 0.0
+
+    @property
     def mode(self) -> str:
         """Inferred mode label from (query_len, kv_cache_len)."""
         if self.kv_cache_len == 0:
@@ -163,23 +175,85 @@ class RooflineReport:
             return f"decode (B={self.batch}, cache={self.kv_cache_len})"
         return f"mini-prefill (B={self.batch}, Q={self.query_len}, cache={self.kv_cache_len})"
 
-    def __str__(self) -> str:
-        sep = "-" * 92
-        header_cols = [
-            f"{'idx':>4}",
-            f"{'kind':<10}",
-            f"{'name':<32}",
-            f"{'flops':>14}",
-            f"{'bytes':>12}",
-            f"{'AI':>8}",
+    # ----- Per-module helpers (used by Level 2 / 3 formatters) ------------- #
+
+    def _module_time_s(self, m: "ModuleStat") -> float:
+        """Theoretical time for one module on this report's hardware/dtype:
+        ``max(m.flops/peak_flops, m.bytes/hbm_bandwidth)``. Sum over modules
+        is the no-cross-module-overlap pessimistic bound; the global
+        :attr:`roofline_time_s` is the with-overlap optimistic bound."""
+        peak = self.hardware.peak_flops.get(self.dtype, 0.0)
+        bw = self.hardware.hbm_bandwidth
+        if peak <= 0 or bw <= 0:
+            return 0.0
+        return max(m.flops / peak, m.bytes / bw)
+
+    def _module_bound(self, m: "ModuleStat") -> str:
+        """Per-module bottleneck letter: 'C' (compute), 'M' (memory), '?'.
+        Determined by comparing m.flops/peak vs m.bytes/bw on this hardware.
+        """
+        peak = self.hardware.peak_flops.get(self.dtype, 0.0)
+        bw = self.hardware.hbm_bandwidth
+        if peak <= 0 or bw <= 0:
+            return "?"
+        return "C" if m.flops / peak >= m.bytes / bw else "M"
+
+    # ----- Three-level formatters ------------------------------------------ #
+
+    def format(self, level: int = 2) -> str:
+        """Format the report at one of three verbosity levels.
+
+        * level=1 — single-line summary (totals + tokens/sec + bottleneck)
+        * level=2 — full per-module table with bound and %time columns
+        * level=3 — same totals as level=2, but rows aggregated by
+          ``(kind, name)`` so e.g. all 58 ``ffn:dsv4_moe`` layers collapse
+          into one row showing combined contribution
+        """
+        if level == 1:
+            return self._format_level1()
+        if level == 2:
+            return self._format_level2()
+        if level == 3:
+            return self._format_level3()
+        raise ValueError(f"level must be 1, 2, or 3; got {level}")
+
+    def _header_line(self) -> str:
+        return f"Roofline | {self.hardware.name} | {_dtype_short(self.dtype)} | {self._mode_label()}"
+
+    def _footer_lines(self) -> list[str]:
+        return [
+            f"TOTAL: {_scale_flops(self.total_flops)} / "
+            f"{_scale_bytes(self.total_bytes)} / "
+            f"AI = {self.arithmetic_intensity:.1f}",
+            f"{self.hardware.name}: "
+            f"compute={_scale_time(self.compute_time_s)}, "
+            f"memory={_scale_time(self.memory_time_s)} "
+            f"-> bottleneck={self.bottleneck} "
+            f"({_scale_time(self.roofline_time_s)} / forward, "
+            f"{self.tokens_per_sec:,.0f} tok/s)",
         ]
-        lines = [
-            f"Roofline | {self.hardware.name} | {_dtype_short(self.dtype)} | {self._mode_label()}",
-            sep,
-            "  ".join(header_cols),
-            sep,
-        ]
-        for m in self.modules:
+
+    def _format_level1(self) -> str:
+        return (
+            f"{self.hardware.name} | {_dtype_short(self.dtype)} | {self._mode_label()} | "
+            f"{_scale_flops(self.total_flops)} / {_scale_bytes(self.total_bytes)} / "
+            f"AI={self.arithmetic_intensity:.1f} -> "
+            f"{_scale_time(self.roofline_time_s)} ({self.bottleneck}) "
+            f"{self.tokens_per_sec:,.0f} tok/s"
+        )
+
+    def _format_level2(self) -> str:
+        sep = "-" * 110
+        per_module_times = [self._module_time_s(m) for m in self.modules]
+        sum_t = sum(per_module_times) or 1.0  # avoid /0 in pct
+
+        header = "  ".join([
+            f"{'idx':>4}", f"{'kind':<10}", f"{'name':<32}",
+            f"{'flops':>14}", f"{'bytes':>12}", f"{'AI':>6}",
+            f"{'b':>1}", f"{'time':>10}", f"{'%t':>5}",
+        ])
+        lines = [self._header_line(), sep, header, sep]
+        for m, t in zip(self.modules, per_module_times):
             idx = "-" if m.layer_idx is None else str(m.layer_idx)
             lines.append("  ".join([
                 f"{idx:>4}",
@@ -187,22 +261,104 @@ class RooflineReport:
                 f"{m.name:<32}",
                 f"{_scale_flops(m.flops):>14}",
                 f"{_scale_bytes(m.bytes):>12}",
-                f"{m.arithmetic_intensity:>8.1f}",
+                f"{m.arithmetic_intensity:>6.1f}",
+                f"{self._module_bound(m):>1}",
+                f"{_scale_time(t):>10}",
+                f"{(t / sum_t * 100):>5.1f}",
             ]))
         lines.append(sep)
-        lines.append(
-            f"TOTAL: {_scale_flops(self.total_flops)} / "
-            f"{_scale_bytes(self.total_bytes)} / "
-            f"AI = {self.arithmetic_intensity:.1f}"
-        )
-        lines.append(
-            f"{self.hardware.name}: "
-            f"compute={_scale_time(self.compute_time_s)}, "
-            f"memory={_scale_time(self.memory_time_s)} "
-            f"-> bottleneck={self.bottleneck} "
-            f"({_scale_time(self.roofline_time_s)} / forward)"
-        )
+        lines.extend(self._footer_lines())
+        lines.append("b: C=compute-bound, M=memory-bound  "
+                     "(%t = per-module time / sum of per-module times)")
         return "\n".join(lines)
+
+    def _format_level3(self) -> str:
+        # Aggregate by (kind, name). For top-level kinds where kind == purpose
+        # (embedding/norm/lm_head/unknown) display "name" alone; for layer
+        # kinds (mixer/ffn) prefix the kind so e.g. mixer:dsv4_moe is
+        # distinguishable from ffn:dsv4_moe (would never collide today, but
+        # keeps the convention readable when scanning).
+        from collections import OrderedDict
+
+        groups: "OrderedDict[str, dict]" = OrderedDict()
+        for m, t in zip(self.modules, [self._module_time_s(m) for m in self.modules]):
+            key = f"{m.kind}:{m.name}" if m.kind in ("mixer", "ffn") else m.name
+            g = groups.setdefault(key, {"count": 0, "flops": 0, "bytes": 0, "time": 0.0,
+                                       "compute_bound_count": 0, "memory_bound_count": 0})
+            g["count"] += 1
+            g["flops"] += m.flops
+            g["bytes"] += m.bytes
+            g["time"] += t
+            if self._module_bound(m) == "C":
+                g["compute_bound_count"] += 1
+            elif self._module_bound(m) == "M":
+                g["memory_bound_count"] += 1
+
+        sum_t = sum(g["time"] for g in groups.values()) or 1.0
+
+        sep = "-" * 110
+        header = "  ".join([
+            f"{'component':<32}", f"{'count':>5}",
+            f"{'flops':>14}", f"{'bytes':>12}", f"{'AI':>6}",
+            f"{'b':>1}", f"{'time':>10}", f"{'%t':>5}",
+        ])
+        lines = [self._header_line(), sep, header, sep]
+        for name, g in groups.items():
+            ai = (g["flops"] / g["bytes"]) if g["bytes"] > 0 else 0.0
+            # Group bound: majority across members (almost always uniform for
+            # same-named modules; '?' when neither dominates).
+            cb, mb = g["compute_bound_count"], g["memory_bound_count"]
+            bnd = "C" if cb > mb else ("M" if mb > cb else "?")
+            lines.append("  ".join([
+                f"{name:<32}",
+                f"{g['count']:>5}",
+                f"{_scale_flops(g['flops']):>14}",
+                f"{_scale_bytes(g['bytes']):>12}",
+                f"{ai:>6.1f}",
+                f"{bnd:>1}",
+                f"{_scale_time(g['time']):>10}",
+                f"{(g['time'] / sum_t * 100):>5.1f}",
+            ]))
+        lines.append(sep)
+        lines.extend(self._footer_lines())
+        lines.append("b: C=compute-bound, M=memory-bound  "
+                     "(%t = group time / sum of all group times)")
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.format(level=2)
+
+
+def format_comparison(
+    reports: "list[RooflineReport]",
+    title: Optional[str] = None,
+) -> str:
+    """Compact cross-hardware comparison block — Level-1 view across devices.
+
+    All ``reports`` should describe the same case (same flops/bytes/AI);
+    only ``hardware`` should differ. Output: a shared metrics line plus one
+    row per hardware showing time, throughput, and bottleneck.
+    """
+    if not reports:
+        return ""
+    rep0 = reports[0]
+    lines: list[str] = []
+    if title:
+        lines.append(f"--- {title} ---")
+    lines.append(
+        f"  FLOPs={_scale_flops(rep0.total_flops)}  "
+        f"bytes={_scale_bytes(rep0.total_bytes)}  "
+        f"AI={rep0.arithmetic_intensity:.1f}"
+    )
+    name_w = max(len(r.hardware.name) for r in reports)
+    for r in reports:
+        lines.append(
+            f"  {r.hardware.name:<{name_w}}  "
+            f"{_scale_time(r.roofline_time_s):>10}  "
+            f"{r.tokens_per_sec:>9,.0f} tok/s  "
+            f"({r.bottleneck:7} bound)"
+        )
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +542,7 @@ def roofline_mini_prefill(
 __all__ = [
     "ModuleStat",
     "RooflineReport",
+    "format_comparison",
     "roofline",
     "roofline_prefill",
     "roofline_decode",

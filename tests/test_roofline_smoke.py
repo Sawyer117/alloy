@@ -40,10 +40,13 @@ from alloy.roofline import (
     RooflineSpec,
     SPEC_REGISTRY,
     dtype_size,
+    format_comparison,
     get_hardware,
     get_spec,
     register_spec,
     roofline,
+    roofline_decode,
+    roofline_prefill,
 )
 
 
@@ -308,6 +311,75 @@ def test_custom_hardware_fp8_when_available():
         raise AssertionError("expected ValueError on fp8 with old torch")
 
 
+def test_tokens_per_sec_and_per_module_bound():
+    """Verify tokens_per_sec / time_per_token math + per-module bound returns
+    'C' or 'M' (never 'unknown')."""
+    mixer_name = "__bound_test_mixer__"
+    SPEC_REGISTRY.pop(mixer_name, None)
+    register_spec(mixer_name, LinearSpec(128, 128))
+    try:
+        config = SimpleNamespace(
+            layer_types=[mixer_name],
+            ffn_types=[mixer_name],
+            hidden_size=128, vocab_size=1024, tie_word_embeddings=False,
+        )
+        report = roofline_prefill(config, batch=1, seq_len=64, hardware="A100")
+        # tokens_per_sec * roofline_time = batch * query_len = 64
+        assert abs(report.tokens_per_sec * report.roofline_time_s - 64) < 1e-6
+        assert abs(report.time_per_token_s - report.roofline_time_s / 64) < 1e-12
+        # Every module should produce a defined bound (C or M, never '?')
+        bounds = [report._module_bound(m) for m in report.modules]
+        assert all(b in ("C", "M") for b in bounds), f"unexpected bounds: {bounds}"
+        # Per-module times should be non-negative
+        times = [report._module_time_s(m) for m in report.modules]
+        assert all(t >= 0 for t in times)
+        print(f"[ok] tokens_per_sec={report.tokens_per_sec:.0f}  "
+              f"per-module bounds={'/'.join(set(bounds))}")
+    finally:
+        SPEC_REGISTRY.pop(mixer_name, None)
+
+
+def test_format_levels_run_with_markers():
+    """Each format level + format_comparison should produce a non-empty string
+    containing a level-specific marker. We don't pin exact layout."""
+    mixer_name = "__fmt_test_mixer__"
+    SPEC_REGISTRY.pop(mixer_name, None)
+    register_spec(mixer_name, LinearSpec(128, 128))
+    try:
+        config = SimpleNamespace(
+            layer_types=[mixer_name, mixer_name],
+            ffn_types=[mixer_name, mixer_name],
+            hidden_size=128, vocab_size=1024, tie_word_embeddings=False,
+        )
+        rep_h100 = roofline_prefill(config, batch=1, seq_len=64, hardware="H100")
+        rep_a100 = roofline_prefill(config, batch=1, seq_len=64, hardware="A100")
+
+        s1 = rep_h100.format(level=1)
+        s2 = rep_h100.format(level=2)
+        s3 = rep_h100.format(level=3)
+        scmp = format_comparison([rep_h100, rep_a100], title="prefill seq=64")
+
+        # Level 1: single-line summary, must mention tokens/sec
+        assert "tok/s" in s1 and "\n" not in s1, "level=1 should be one line with tok/s"
+        # Level 2: per-module table marker '%t' header column + bound legend
+        assert "%t" in s2 and "compute-bound" in s2, "level=2 missing bound/percent markers"
+        # Level 3: aggregated table — header has 'count' column + same bound legend
+        assert "count" in s3 and "compute-bound" in s3, "level=3 missing aggregated marker"
+        # format_comparison: title + multiple hardware names
+        assert "prefill seq=64" in scmp and "H100-SXM5" in scmp and "A100-80GB-SXM" in scmp
+
+        # invalid level raises
+        try:
+            rep_h100.format(level=99)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError on invalid level")
+        print("[ok] format(level=1/2/3) and format_comparison emit expected markers")
+    finally:
+        SPEC_REGISTRY.pop(mixer_name, None)
+
+
 def test_roofline_end_to_end():
     """Tiny synthetic 'model': 2 layers, each layer is 1 mixer-as-Linear + 1
     ffn-as-Linear, all hidden=128. Verifies aggregation and the embedding /
@@ -441,6 +513,8 @@ def main() -> int:
     test_custom_hardware_works_through_roofline()
     test_custom_hardware_roundtrips_through_get_hardware()
     test_custom_hardware_fp8_when_available()
+    test_tokens_per_sec_and_per_module_bound()
+    test_format_levels_run_with_markers()
     test_roofline_end_to_end()
     test_roofline_strict_missing_raises()
     test_roofline_fail_open_marks_unknown()

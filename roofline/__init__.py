@@ -24,6 +24,7 @@ from __future__ import annotations
 from .analyze import (
     ModuleStat,
     RooflineReport,
+    format_comparison,
     roofline,
     roofline_decode,
     roofline_mini_prefill,
@@ -65,6 +66,7 @@ __all__ = [
     "roofline_mini_prefill",
     "RooflineReport",
     "ModuleStat",
+    "format_comparison",
     # Specs
     "RooflineSpec",
     "LinearSpec",
