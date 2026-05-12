@@ -6,18 +6,15 @@ Covers the CSA (Compressed Sparse Attention) layer's dispatch surface:
   - ``"dsv4_csa.attention"`` has a registered ``"torch"`` impl (alloy's
     own ``_torch_csa_attention`` — the eager fallback that wraps
     ``_eager_attention_with_sinks``).
-  - The binder's ``deepseek_v4.sparse_flash_attention.triton`` adapter
-    is NOT registered (Phase 2: kernel port is in
-    ``hf_npu_binder/deepseek_v4/sparse_flash_attention.py`` but the
-    BHSD-to-SBHD wrapper + sliding-window combining is pending). A
-    config request of ``_dsv4_csa_implementation = "triton"`` therefore
-    falls back to ``"torch"`` via
-    ``get_implementation(..., fallback="torch")`` instead of crashing
-    with NotImplementedError on first forward.
+  - The bridge registers the binder's
+    ``deepseek_v4.sparse_flash_attention.triton`` and ``.ascendc``
+    adapters as the ``"triton"`` / ``"ascendc"`` impls under the same
+    dispatch key.
   - ``activate(model, prefer=...)`` writes a ``_dsv4_csa_implementation``
-    field on the config that resolves to a working callable for every
+    field on the config that resolves to a working impl name for every
     intent in ``hf_npu_binder.DEFAULTS["deepseek_v4.sparse_flash_attention"]``
-    (today: auto / flash / triton all map to ``"torch"``).
+    (auto / flash / triton -> ``"triton"``; ascendc -> ``"ascendc"``;
+    torch -> ``"torch"``).
 
 Cross-cutting bridge tests (DEFAULTS schema, intent broadcast,
 binder-side hygiene) live in ``test_hf_npu_binder_bridge.py``.
@@ -78,53 +75,70 @@ def test_dsv4_csa_torch_is_alloy_native() -> None:
     )
 
 
-def test_dsv4_csa_triton_not_registered_yet() -> None:
-    """The binder's ``sparse_flash_attention.triton`` (alloy adapter) is
-    Phase 2 work and currently raises NotImplementedError if called. The
-    bridge deliberately does not register it into alloy's IMPL_REGISTRY
-    so that requests for ``triton`` quietly fall back to ``torch`` via
-    ``get_implementation(..., fallback="torch")`` rather than crashing.
+def test_dsv4_csa_triton_registered() -> None:
+    """The binder's ``sparse_flash_attention.triton`` adapter (BHSD-to-SBND
+    permute + combined-topk construction over the vendored MindSpeed
+    kernel) is registered under ``dsv4_csa.attention:triton``."""
+    from hf_npu_binder.deepseek_v4 import sparse_flash_attention as _hf_sfa
 
-    Once Phase 2 lands (BHSD-to-SBHD wrapper + sliding + SFA combining),
-    update this test to assert ``"triton"`` IS in the impl set and
-    points to the binder symbol.
-    """
     impls = list_implementations("dsv4_csa")
     csa_attn_impls = set(impls.get("dsv4_csa.attention", {}))
-    assert "triton" not in csa_attn_impls, (
-        f"dsv4_csa.attention:triton appears registered; binder adapter is "
-        f"Phase 2 NotImplementedError. Update this test when the adapter ships."
+    assert "triton" in csa_attn_impls, (
+        f"dsv4_csa.attention:triton not registered; "
+        f"got: {sorted(csa_attn_impls)}"
     )
-    # And ``get_implementation`` falls back cleanly:
-    fn = get_implementation("dsv4_csa.attention", "triton", fallback="torch")
-    assert fn is _torch_csa_attention, (
-        "fallback chain should resolve to the registered torch impl"
+    fn = get_implementation("dsv4_csa.attention", "triton")
+    assert fn is _hf_sfa.triton, (
+        f"dsv4_csa.attention:triton should be hf_npu_binder's triton adapter, "
+        f"got {fn!r}"
+    )
+
+
+def test_dsv4_csa_ascendc_registered() -> None:
+    """The binder's ``sparse_flash_attention.ascendc`` adapter (wrap CANN's
+    ``aclnnSparseAttnSharedkv`` op) is registered under
+    ``dsv4_csa.attention:ascendc``. It needs a CANN release that ships
+    the aclnn op in ``libopapi.so`` to actually run, but registration
+    works on any environment — the import is cheap and the aclnn lookup
+    is deferred to the first forward call."""
+    from hf_npu_binder.deepseek_v4 import sparse_flash_attention as _hf_sfa
+
+    fn = get_implementation("dsv4_csa.attention", "ascendc")
+    assert fn is _hf_sfa.ascendc, (
+        f"dsv4_csa.attention:ascendc should be hf_npu_binder's ascendc adapter, "
+        f"got {fn!r}"
     )
 
 
 def test_activate_writes_dsv4_csa_field() -> None:
     """``activate(model, prefer=...)`` includes the DSV4 CSA field in its
-    broadcast and writes a working impl name (``"torch"`` until the SFA
-    adapter ships)."""
-    for intent in ("auto", "flash", "triton"):
+    broadcast and writes the impl that DEFAULTS recommends for each
+    intent."""
+    expected = {
+        "auto":    "triton",
+        "flash":   "triton",
+        "triton":  "triton",
+        "ascendc": "ascendc",
+        "torch":   "torch",
+    }
+    for intent, want_impl in expected.items():
         model = _fake_model()
         chosen = bridge.activate(model, prefer=intent)
         assert "_dsv4_csa_implementation" in chosen, (
             f"activate(prefer={intent!r}) did not touch _dsv4_csa_implementation"
         )
-        impl = chosen["_dsv4_csa_implementation"]
-        # While the binder triton adapter is pending, every intent maps
-        # to "torch" per DEFAULTS. Update this when the adapter ships.
-        assert impl == "torch", (
-            f"intent={intent!r} -> impl={impl!r}; expected 'torch' while "
-            f"the SFA adapter is pending in binder"
+        got = chosen["_dsv4_csa_implementation"]
+        assert got == want_impl, (
+            f"intent={intent!r} -> impl={got!r}; expected {want_impl!r} per "
+            f"binder DEFAULTS"
         )
 
 
 _TESTS = [
     test_dsv4_csa_attention_torch_registered,
     test_dsv4_csa_torch_is_alloy_native,
-    test_dsv4_csa_triton_not_registered_yet,
+    test_dsv4_csa_triton_registered,
+    test_dsv4_csa_ascendc_registered,
     test_activate_writes_dsv4_csa_field,
 ]
 

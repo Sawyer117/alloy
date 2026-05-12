@@ -26,6 +26,7 @@ from hf_npu_binder.qwen3_5_moe import (
     experts as _hf_experts,
     fused_recurrent_gated_delta_rule as _hf_recurrent_gdr,
 )
+from hf_npu_binder.deepseek_v4 import sparse_flash_attention as _hf_sfa
 
 # alloy's own per-module dispatch table (GDN sub-functions live here).
 from alloy.modules.registry import DEFAULT_IMPL, register_implementation
@@ -63,17 +64,20 @@ _HF_EXPERTS_BINDINGS: tuple[tuple[str, object], ...] = (
     ("flash", _hf_experts.flash),
 )
 
-# DSV4 CSA SFA: kernel port from MindSpeed-LLM is pending (the binder's
-# ``deepseek_v4.sparse_flash_attention.triton`` raises NotImplementedError
-# until then). We deliberately do NOT add it to the bindings tuple here —
-# leaving it unregistered means a config request of
-# ``_dsv4_csa_implementation="triton"`` resolves to ``"torch"`` via
-# ``get_implementation(..., fallback="torch")``, instead of crashing with
-# NotImplementedError on first CSA forward. The activatable field is still
-# wired below so ``activate(model, "auto")`` reaches it; DEFAULTS' DSV4 entry
-# (which maps every intent to ``"torch"`` while the port is pending) is what
-# makes that resolve cleanly.
-_DEEPSEEK_V4_BINDINGS: tuple[tuple[str, str, object], ...] = ()
+# DSV4 CSA SFA. Two backends now wired:
+#   * ``triton`` — vendored MindSpeed kernel + BHSD-to-SBND adapter with
+#     combined-topk construction. Works on any CANN that supports
+#     triton-ascend (no aclnn op dependency). Default under "auto".
+#   * ``ascendc`` — CANN's ``aclnnSparseAttnSharedkv``, requires the op
+#     to exist in ``libopapi.so`` (CANN 9.0.0 release+; 9.0.0-beta.1
+#     is missing the symbol). Explicit opt-in via DEFAULTS / activate.
+# The ``flash`` intent maps to ``triton`` in DEFAULTS — there is no
+# dedicated flash CSA backend — so a single ``activate(model, "flash")``
+# call still gets the fast path on DSV4 layers.
+_DEEPSEEK_V4_BINDINGS: tuple[tuple[str, str, object], ...] = (
+    ("dsv4_csa.attention", "triton",  _hf_sfa.triton),
+    ("dsv4_csa.attention", "ascendc", _hf_sfa.ascendc),
+)
 
 # Config field names that ``activate(prefer="<backend>")`` will broadcast a
 # backend choice across, paired with the *primary* binder operator key the
@@ -104,10 +108,6 @@ def _register_all() -> None:
 
     for alloy_key, impl_name, fn in _DEEPSEEK_V4_BINDINGS:
         register_implementation(alloy_key, impl_name, fn, override=True)
-    # DSV4 SFA: field is activatable even though the binder has no
-    # callable to register yet — DEFAULTS' DSV4 entry routes every intent
-    # to ``"torch"`` so ``activate(model, "...")`` still produces a
-    # working configuration (alloy's own torch impl is what gets called).
     _ACTIVATABLE_FIELDS.append(
         ("_dsv4_csa_implementation", "deepseek_v4.sparse_flash_attention")
     )

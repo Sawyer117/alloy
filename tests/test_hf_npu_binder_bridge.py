@@ -51,21 +51,22 @@ def test_activate_broadcast() -> None:
     Today's DEFAULTS:
       - qwen3_5_moe.chunk_gated_delta_rule + experts both ship "flash",
         so an intent of ``"flash"`` lands literally.
-      - deepseek_v4.sparse_flash_attention has no triton/flash port yet,
-        so every intent in its DEFAULTS entry maps to ``"torch"``.
+      - deepseek_v4.sparse_flash_attention has no dedicated flash
+        backend; its DEFAULTS routes ``"flash"`` to ``"triton"`` (the
+        BHSD adapter over the vendored MindSpeed kernel).
     """
     model = _fake_model()
     chosen = bridge.activate(model, prefer="flash")
     expected = {
         "_qwen3_5_gdn_implementation": "flash",
         "_experts_implementation":     "flash",
-        "_dsv4_csa_implementation":    "torch",  # SFA kernel port pending
+        "_dsv4_csa_implementation":    "triton",  # SFA: flash -> triton
     }
     assert chosen == expected, chosen
     cfg = model.config
     assert getattr(cfg, "_qwen3_5_gdn_implementation") == "flash"
     assert getattr(cfg, "_experts_implementation") == "flash"
-    assert getattr(cfg, "_dsv4_csa_implementation") == "torch"
+    assert getattr(cfg, "_dsv4_csa_implementation") == "triton"
 
 
 def test_activate_auto_per_operator_recommendation() -> None:
@@ -78,12 +79,12 @@ def test_activate_auto_per_operator_recommendation() -> None:
     # Each value must be an actual impl name registered in IMPL_REGISTRY,
     # not the literal "auto".
     assert "auto" not in chosen.values(), chosen
-    # GDN's current auto is triton; experts' is flash; SFA's is torch
-    # (kernel port pending). Update this expectation if binder's
-    # DEFAULTS changes.
+    # GDN -> triton; experts -> flash; SFA -> triton (the BHSD adapter
+    # is the current default until a verified-fast CANN version with
+    # ``aclnnSparseAttnSharedkv`` is widely available).
     assert chosen["_qwen3_5_gdn_implementation"] == "triton"
     assert chosen["_experts_implementation"] == "flash"
-    assert chosen["_dsv4_csa_implementation"] == "torch"
+    assert chosen["_dsv4_csa_implementation"] == "triton"
 
 
 def test_activate_explicit_mapping_with_bare_module_key() -> None:
