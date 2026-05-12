@@ -137,9 +137,10 @@ def _diff_captures(
     layer_types: list[str],
 ) -> None:
     print()
-    print("=" * 78)
-    print(f"{'point':22s} {'layer_type':28s} {'max_abs':>12s} {'mean_abs':>12s}")
-    print("-" * 78)
+    print("=" * 102)
+    print(f"{'point':22s} {'layer_type':28s} "
+          f"{'max_abs':>12s} {'mean_abs':>12s} {'max_rel':>12s} {'mean_rel':>12s}")
+    print("-" * 102)
     keys = list(a.keys())
     for k in keys:
         ta_list, tb_list = a.get(k, []), b.get(k, [])
@@ -150,10 +151,21 @@ def _diff_captures(
             print(f"{k:22s} {'shape mismatch':28s} {tuple(ta.shape)} vs {tuple(tb.shape)}")
             continue
         d = (ta - tb).abs()
+        ref = ta.abs()
+        # max_rel: drift relative to the largest reference value (how much
+        # of the largest signal does the worst-position drift represent).
+        # mean_rel: mean drift / mean signal magnitude (the bulk noise-floor
+        # ratio). 1e-3 ~ 1e-2 in bf16 is the normal fused-kernel envelope.
+        max_ref = ref.max().item()
+        mean_ref = ref.mean().item()
+        max_rel = d.max().item() / max_ref if max_ref > 0 else 0.0
+        mean_rel = d.mean().item() / mean_ref if mean_ref > 0 else 0.0
         layer_idx = int(k.split("_")[1]) if k.startswith("layer_") else -1
         lt = layer_types[layer_idx] if 0 <= layer_idx < len(layer_types) else ""
-        print(f"{k:22s} {lt:28s} {d.max().item():12.4e} {d.mean().item():12.4e}")
-    print("=" * 78)
+        print(f"{k:22s} {lt:28s} "
+              f"{d.max().item():12.4e} {d.mean().item():12.4e} "
+              f"{max_rel:12.4e} {mean_rel:12.4e}")
+    print("=" * 102)
 
 
 # ---------------------------------------------------------------------------
