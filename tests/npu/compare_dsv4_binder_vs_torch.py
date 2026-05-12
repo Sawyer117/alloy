@@ -243,8 +243,16 @@ def main() -> int:
     input_ids = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len)).to(device)
 
     # =========================================================================
-    # Phase 1: BASELINE — alloy default ('torch' dispatch)
+    # Phase 1: BASELINE — explicitly force CSA to torch dispatch
     # =========================================================================
+    # Importing the binder bridge sets ``DEFAULT_IMPL["dsv4_csa"]`` to whatever
+    # binder DEFAULTS' "auto" entry resolves to (currently "triton"). Without
+    # an explicit override the baseline would ALSO pick up triton — turning
+    # the whole comparison into "triton vs triton" with the same callable
+    # serving both phases, which makes the diff a kernel-determinism probe
+    # rather than a wrapper-correctness probe. Force torch here so the
+    # baseline is alloy's _torch_csa_attention (byte-correct against HF).
+    cfg._dsv4_csa_implementation = "torch"
     print("\n" + "=" * 70)
     print("[baseline] alloy default (CSA -> _torch_csa_attention)")
     torch.manual_seed(args.seed)
