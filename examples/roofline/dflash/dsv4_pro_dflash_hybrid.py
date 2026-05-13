@@ -99,7 +99,8 @@ def main() -> int:
 
     my_device = CustomHardware(
         name="my-device", hbm_bandwidth=8e12,
-        bf16=2250e12, fp32=80e12, fp8=4500e12,
+        fp16=1000e12, bf16=1000e12, fp8=2000e12,
+        # fp4 ~ 4 PFLOPS placeholder (not stored).
     )
 
     cases = [
@@ -107,7 +108,7 @@ def main() -> int:
         ("decode (cache=8192)",   lambda hw: roofline_decode (config, batch=1, kv_cache_len=8192,  hardware=hw)),
         ("decode (cache=131072)", lambda hw: roofline_decode (config, batch=1, kv_cache_len=131072, hardware=hw)),
     ]
-    hardware_options = ["H100", "Ascend910C", my_device]
+    hardware_options = ["H100", "Ascend950PR", my_device]
 
     if args.level == 1:
         for case_name, runner in cases:

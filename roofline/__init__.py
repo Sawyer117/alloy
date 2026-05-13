@@ -35,6 +35,7 @@ from .hardware import (
     ASCEND_910B,
     ASCEND_910B1,
     ASCEND_910C,
+    ASCEND_950PR,
     H100,
     PRESETS,
     CustomHardware,
@@ -83,6 +84,7 @@ __all__ = [
     "ASCEND_910B",
     "ASCEND_910B1",
     "ASCEND_910C",
+    "ASCEND_950PR",
     "PRESETS",
     "get_hardware",
 ]

@@ -156,6 +156,32 @@ ASCEND_910C = Hardware(
 )
 
 
+# Ascend 950PR — published / leaked specs for the next-gen Ascend with
+# native FP8 / FP4 cube support. BF16 throughput is not directly published
+# at the time of this preset; we infer it from the FP8:BF16 = 2:1 industry
+# pattern (H100, B100, MI300X all keep BF16 at ~half of FP8). The vector
+# unit numbers from 910C scale proportionally — kept conservative since
+# the actual 950 vector spec hasn't been independently verified.
+# FP4 cube throughput is 2 PFLOPS (twice FP8); not stored in peak_flops
+# because alloy roofline runs in bf16 by default and torch lacks a
+# float4 dtype key.
+ASCEND_950PR = Hardware(
+    name="Ascend-950PR",
+    peak_flops={
+        torch.bfloat16: 500 * T,    # estimated, FP8 / 2 per the industry convention
+        torch.float16:  500 * T,    # same as BF16
+        torch.float32:  125 * T,    # estimated, FP16 / 4
+        torch.float8_e4m3fn: 1000 * T,  # 1 PFLOPS FP8 (published)
+        # FP4: 2 PFLOPS (published) — not stored, no torch dtype for it.
+    },
+    peak_vector_flops={
+        torch.float16:  60 * T,    # scaled from 910C
+        torch.float32:  30 * T,
+    },
+    hbm_bandwidth=1600 * G,  # 1.6 TB/s
+)
+
+
 # Backward-compat alias — earlier code referenced ASCEND_910B; keep the
 # symbol pointing at the 910B1 Hardware instance so existing imports and
 # preset names ("Ascend910B") continue to resolve.
@@ -168,6 +194,7 @@ PRESETS: dict[str, Hardware] = {
     "Ascend910B": ASCEND_910B1,    # backward-compat alias
     "Ascend910B1": ASCEND_910B1,
     "Ascend910C": ASCEND_910C,
+    "Ascend950PR": ASCEND_950PR,
 }
 
 
@@ -276,6 +303,7 @@ __all__ = [
     "ASCEND_910B",
     "ASCEND_910B1",
     "ASCEND_910C",
+    "ASCEND_950PR",
     "PRESETS",
     "get_hardware",
     "CustomHardware",

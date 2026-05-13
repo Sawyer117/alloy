@@ -156,12 +156,13 @@ def main() -> int:
     print()
 
     # Illustrative custom chip — same numbers as dsv4_pro for direct A/B.
+    # fp4 ~ 4 PFLOPS placeholder, not stored (no torch.float4 dtype key).
     my_device = CustomHardware(
         name="my-device",
         hbm_bandwidth=8e12,
-        bf16=2250e12,
-        fp32=80e12,
-        fp8=4500e12,
+        fp16=1000e12,
+        bf16=1000e12,                 # industry convention: BF16 = FP16
+        fp8=2000e12,
     )
 
     cases = [
@@ -169,7 +170,7 @@ def main() -> int:
         ("mini-prefill (Q=512, P=8192)", lambda hw: roofline_mini_prefill(config, batch=1, chunk_len=512, kv_cache_len=8192, hardware=hw)),
         ("decode (cache=32768)",         lambda hw: roofline_decode      (config, batch=1, kv_cache_len=32768,              hardware=hw)),
     ]
-    hardware_options = ["H100", "Ascend910C", my_device]
+    hardware_options = ["H100", "Ascend950PR", my_device]
 
     if args.level == 1:
         for case_name, runner in cases:
