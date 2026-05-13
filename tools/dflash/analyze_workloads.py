@@ -46,6 +46,10 @@ Usage::
 
     # dump full data for downstream analysis
     python -m alloy.tools.dflash.analyze_workloads --csv /tmp/dflash_sweep.csv
+
+    # human-readable Excel workbook (one sheet per (hw, mode), colour-coded
+    # by bound, plus a flat 'totals' sheet with auto-filter)
+    python -m alloy.tools.dflash.analyze_workloads --xlsx /tmp/dflash_sweep.xlsx
 """
 from __future__ import annotations
 
@@ -303,6 +307,171 @@ def _component_block(
     )
 
 
+def _dump_xlsx(
+    results: dict,
+    path: str,
+    hardware_names: list[str],
+    models: list[str],
+    batches: list[int],
+    seq_lens: list[int],
+    dtype: torch.dtype,
+) -> None:
+    """Write an Excel workbook readable in Excel / LibreOffice / Google Sheets.
+
+    Layout:
+      * Sheet ``README`` — sweep parameters, hardware specs (peak, HBM,
+        ridge point), color-coding legend.
+      * One sheet per ``(hardware, mode)`` named ``{hw}_{mode}``. Rows
+        are ``(model, batch)``; columns are seq_lens; each cell holds
+        the wall-clock time + tok/s on two lines, with cell background
+        coloured by bottleneck (M = light red, C = light green).
+      * Sheet ``totals`` — flat per-(model, hw, B, S, mode) table for
+        downstream pivot / filter work.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    MEM_FILL = PatternFill("solid", fgColor="FCE4E4")     # light red
+    COMP_FILL = PatternFill("solid", fgColor="E4F4E4")    # light green
+    HEADER_FILL = PatternFill("solid", fgColor="D9E1F2")  # light blue
+    HEADER_FONT = Font(bold=True)
+    CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    LEFT = Alignment(horizontal="left", vertical="center")
+    THIN = Side(style="thin", color="CCCCCC")
+    BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+    wb = Workbook()
+    # default sheet → README
+    ws = wb.active
+    ws.title = "README"
+    ws["A1"] = "DSV4 + DFlash roofline workload sweep"
+    ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = f"dtype: {dtype}"
+    ws["A3"] = f"models  : {', '.join(models)}"
+    ws["A4"] = f"batches : {batches}"
+    ws["A5"] = f"seq_lens: {seq_lens}  (labels: {[_scale_seq(s) for s in seq_lens]})"
+
+    ws["A7"] = "Hardware"
+    ws["B7"] = "Peak (TFLOPS)"
+    ws["C7"] = "HBM (TB/s)"
+    ws["D7"] = "Ridge point (FLOPs / byte)"
+    for col in "ABCD":
+        ws[f"{col}7"].font = HEADER_FONT
+        ws[f"{col}7"].fill = HEADER_FILL
+        ws[f"{col}7"].alignment = CENTER
+    for i, hw_name in enumerate(hardware_names):
+        hw = _resolve_hardware(hw_name)
+        peak = hw.peak_flops.get(dtype, 0.0)
+        ridge = _ridge_point(hw, dtype)
+        row = 8 + i
+        ws.cell(row=row, column=1, value=hw.name)
+        ws.cell(row=row, column=2, value=round(peak / 1e12, 2))
+        ws.cell(row=row, column=3, value=round(hw.hbm_bandwidth / 1e12, 3))
+        ws.cell(row=row, column=4, value=round(ridge, 1))
+
+    legend_start = 10 + len(hardware_names)
+    ws.cell(row=legend_start, column=1, value="Cell colour legend")
+    ws.cell(row=legend_start, column=1).font = Font(bold=True)
+    ws.cell(row=legend_start + 1, column=1, value="memory-bound").fill = MEM_FILL
+    ws.cell(row=legend_start + 2, column=1, value="compute-bound").fill = COMP_FILL
+    ws.cell(row=legend_start + 4, column=1, value=(
+        "Cell content: ``time`` on top line, ``tok/s`` below. Bound classification "
+        "comes from max(compute_time, memory_time) — whichever wins is the cell's bound."
+    ))
+    ws.cell(row=legend_start + 4, column=1).alignment = Alignment(wrap_text=True)
+    ws.merge_cells(start_row=legend_start + 4, start_column=1, end_row=legend_start + 4, end_column=7)
+
+    for col_letter, width in zip("ABCDE", (28, 18, 14, 28, 18)):
+        ws.column_dimensions[col_letter].width = width
+
+    # --- One sheet per (hw, mode) ---
+    for hw_name in hardware_names:
+        for mode in MODES:
+            sheet_name = f"{hw_name}_{mode}"[:31]  # Excel max sheet name 31 chars
+            ws = wb.create_sheet(sheet_name)
+            ws.cell(row=1, column=1, value=f"{hw_name} | {mode}").font = Font(bold=True, size=12)
+
+            # Header row at row 3
+            header_row = 3
+            ws.cell(row=header_row, column=1, value="model")
+            ws.cell(row=header_row, column=2, value="batch")
+            for j, s in enumerate(seq_lens):
+                ws.cell(row=header_row, column=3 + j, value=_scale_seq(s))
+            for col in range(1, 3 + len(seq_lens)):
+                c = ws.cell(row=header_row, column=col)
+                c.font = HEADER_FONT
+                c.fill = HEADER_FILL
+                c.alignment = CENTER
+                c.border = BORDER
+
+            # Data rows
+            row_idx = header_row + 1
+            for model in models:
+                for B in batches:
+                    ws.cell(row=row_idx, column=1, value=model).alignment = LEFT
+                    ws.cell(row=row_idx, column=2, value=B).alignment = CENTER
+                    for j, s in enumerate(seq_lens):
+                        r = results[(model, hw_name, B, s, mode)]
+                        bound = _bound_letter(r)
+                        fill = MEM_FILL if bound == "M" else COMP_FILL
+                        # Two lines: time + tok/s. Wrap_text makes the newline render.
+                        text = f"{_scale_time(r.roofline_time_s)}\n{_scale_count(r.tokens_per_sec, 'tok/s')}"
+                        c = ws.cell(row=row_idx, column=3 + j, value=text)
+                        c.fill = fill
+                        c.alignment = CENTER
+                        c.border = BORDER
+                    row_idx += 1
+                # Visual gap between models — empty row with thin separator look.
+                row_idx += 1
+
+            # Freeze the header rows + first two cols so scrolling stays legible.
+            ws.freeze_panes = ws.cell(row=header_row + 1, column=3)
+
+            # Column widths: model + batch + seq cols.
+            ws.column_dimensions["A"].width = 28
+            ws.column_dimensions["B"].width = 7
+            for j in range(len(seq_lens)):
+                ws.column_dimensions[get_column_letter(3 + j)].width = 16
+            # Row heights big enough for 2-line cells.
+            for r_i in range(header_row + 1, row_idx):
+                ws.row_dimensions[r_i].height = 28
+
+    # --- Totals sheet (flat) for pivot tables / filters ---
+    ws = wb.create_sheet("totals")
+    headers = ["model", "hardware", "batch", "seq_len", "mode",
+               "total_flops", "total_bytes", "AI", "compute_time_s", "memory_time_s",
+               "roofline_time_s", "tokens_per_sec", "bottleneck"]
+    for j, h in enumerate(headers, 1):
+        c = ws.cell(row=1, column=j, value=h)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+        c.alignment = CENTER
+    r_i = 2
+    for (model, hw, B, S, mode), r in results.items():
+        ws.cell(row=r_i, column=1, value=model)
+        ws.cell(row=r_i, column=2, value=hw)
+        ws.cell(row=r_i, column=3, value=B)
+        ws.cell(row=r_i, column=4, value=S)
+        ws.cell(row=r_i, column=5, value=mode)
+        ws.cell(row=r_i, column=6, value=r.total_flops)
+        ws.cell(row=r_i, column=7, value=r.total_bytes)
+        ws.cell(row=r_i, column=8, value=round(r.arithmetic_intensity, 3))
+        ws.cell(row=r_i, column=9, value=r.compute_time_s)
+        ws.cell(row=r_i, column=10, value=r.memory_time_s)
+        ws.cell(row=r_i, column=11, value=r.roofline_time_s)
+        ws.cell(row=r_i, column=12, value=round(r.tokens_per_sec, 2))
+        ws.cell(row=r_i, column=13, value=r.bottleneck)
+        r_i += 1
+    ws.auto_filter.ref = f"A1:M{r_i - 1}"  # turn on filter
+    ws.freeze_panes = "F2"
+    for j, width in enumerate((28, 14, 7, 12, 14, 16, 16, 8, 14, 14, 14, 14, 12), 1):
+        ws.column_dimensions[get_column_letter(j)].width = width
+
+    wb.save(path)
+    print(f"\nExcel written: {path}")
+
+
 def _dump_csv(results: dict, path: str) -> None:
     """Write two CSV files: model-totals + per-component."""
     totals_path = Path(path)
@@ -398,6 +567,11 @@ def main() -> int:
         "--csv", default=None,
         help="Path prefix to dump full CSV (totals + components).",
     )
+    parser.add_argument(
+        "--xlsx", default=None,
+        help="Path to dump an Excel workbook (one sheet per (hardware, mode) "
+             "plus a README sheet and a flat 'totals' sheet for filtering).",
+    )
     args = parser.parse_args()
 
     models_subset = OrderedDict(
@@ -451,6 +625,12 @@ def main() -> int:
 
     if args.csv:
         _dump_csv(results, args.csv)
+
+    if args.xlsx:
+        _dump_xlsx(
+            results, args.xlsx, hardware_names,
+            list(models_subset.keys()), batches, seq_lens, dtype,
+        )
 
     return 0
 
