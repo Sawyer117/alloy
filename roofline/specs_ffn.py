@@ -79,6 +79,22 @@ def _swiglu_weight_bytes(hidden: int, intermediate: int, es: int, bias: bool = F
 class SwiGLUMLPSpec(RooflineSpec):
     """Spec for a dense SwiGLU MLP: ``down(silu(gate(x)) * up(x))``.
 
+    Variables: N = batch_tokens, H = hidden_size, I = intermediate_size,
+    es = dtype_size(dtype).
+
+    ## FLOPs
+        4 * N * H * I                   # gate + up projections fused as [H -> 2I]
+      + 2 * N * H * I                   # down projection [I -> H]
+      + 5 * N * I                       # silu(gate) * up activation
+      + bias_flops                      # 2*N*I (gate+up biases) + N*H (down bias)
+      = 6 * N * H * I + 5 * N * I [+ bias_flops]
+
+    ## Bytes (optimal fusion, weights-once)
+        3 * H * I * es                  # gate_proj + up_proj + down_proj weights
+      + bias_bytes                      # (2*I + H) * es if bias else 0
+      +     N * H * es                  # activation read
+      +     N * H * es                  # activation write
+
     Optimal-fusion bytes assume the entire MLP runs as one fused kernel:
     the ``[N, 2I]`` and ``[N, I]`` intermediate activations stay in SRAM,
     only the ``[N, H]`` input read and output write hit HBM.
@@ -142,6 +158,27 @@ class DSV4MoESpec(RooflineSpec):
     DSV4-coupled config field names: routed experts use ``n_routed_experts``
     (NOT ``num_experts``) and ``intermediate_size`` for both routed and
     shared expert dims (DSV4 reference uses the same MLP class for both).
+
+    Variables: N = batch_tokens, H = hidden_size, I = intermediate_size,
+    E = n_routed_experts, K = num_experts_per_tok, es = dtype_size(dtype).
+    ``swiglu_flops(N, H, I)`` = 6*N*H*I + 5*N*I (+ bias_flops if bias).
+    ``swiglu_w(H, I)`` = 3*H*I*es (+ bias bytes if bias).
+
+    ## FLOPs
+        2 * N * H * E                   # router score matmul [N,H] @ [H,E]
+      + 5 * N * E                       # router score activation (sqrtsoftplus / sigmoid)
+      + 2 * N * K                       # top-k normalization (sum + divide)
+      + N * K * swiglu_flops(1, H, I)   # routed experts: N*K single-token forwards
+      +     swiglu_flops(N, H, I)       # shared expert: SwiGLU on all N tokens
+      +     N * H                       # final add (routed + shared)
+
+    ## Bytes (optimal fusion, weights loaded once per unique expert)
+        E * H * es                      # router weight [E, H]
+      + router_extras                   # E*es (topk bias) or N*K*8 (hash tid2eid row reads)
+      + min(E, N*K) * swiglu_w(H, I)    # routed expert weights, ANY-routing upper bound
+      +              swiglu_w(H, I)     # shared expert weights (always loaded)
+      +              N * H * es         # activation read
+      +              N * H * es         # activation write
     """
 
     def __init__(self, is_hash: bool = False) -> None:
@@ -234,6 +271,28 @@ class Qwen35MoESpec(RooflineSpec):
     Config field names: ``num_experts`` (Qwen-coupled, distinct from DSV4's
     ``n_routed_experts``), ``num_experts_per_tok``, ``moe_intermediate_size``,
     ``shared_expert_intermediate_size``.
+
+    Variables: N = batch_tokens, H = hidden_size, Im = moe_intermediate_size,
+    Is = shared_expert_intermediate_size, E = num_experts, K = num_experts_per_tok,
+    es = dtype_size(dtype). All linears here are bias=False (Qwen3.5
+    convention).
+
+    ## FLOPs
+        2 * N * H * E                   # router matmul [N,H] @ [H,E]
+      + 5 * N * E                       # router softmax
+      + 2 * N * K                       # top-k normalization
+      + N * K * swiglu_flops(1, H, Im)  # routed experts at Im
+      +     swiglu_flops(N, H, Is)      # shared expert at Is
+      + 2 * N * H + 3 * N + N * H       # shared gate: Linear(H->1) + sigmoid + scalar mul
+      +     N * H                       # final residual add (routed + gated_shared)
+
+    ## Bytes (optimal fusion, weights loaded once per unique expert)
+        E * H * es                      # router weight [E, H]
+      + min(E, N*K) * 3*H*Im*es         # routed expert weights, ANY-routing upper bound
+      +              3*H*Is*es          # shared expert weights (always loaded)
+      +              H * es             # shared_expert_gate weight [H]
+      +              N * H * es         # activation read
+      +              N * H * es         # activation write
     """
 
     def flops(self, in_shape: tuple[int, ...], config, **kwargs) -> int:

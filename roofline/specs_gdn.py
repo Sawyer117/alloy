@@ -204,6 +204,35 @@ class Qwen35GDNSpec(RooflineSpec):
     The state itself is the same shape regardless of cache length, since
     GDN's recurrent state is a fixed-size summary — this is the headline
     long-context advantage over softmax attention's O(T) KV cache.
+
+    Variables: B = batch, Q = query_len, N = B * Q, H = hidden_size,
+    Nk = num_k_heads, Nv = num_v_heads, hkd = head_k_dim, hvd = head_v_dim,
+    qkv_dim = sum of {q,k,v}-proj output dims, K = conv_kernel_size,
+    C = GDN_CHUNK_SIZE (=64), es = dtype_size(dtype). State size per batch
+    element = Nv * hkd * hvd (kept as fp32) plus the conv ring buffer
+    [(K-1) * (Nk*hkd + 2*Nv*hvd) * es].
+
+    ## FLOPs (mode-independent base + mode-dependent attention)
+        linear_proj_flops(N, d)         # q/k/v/o/gate projections (see _linear_proj_flops)
+      + conv_flops(N, d)                # depthwise conv1d on q/k/v concatenated
+      + attn_flops                      # one of:
+            chunk_attn_flops(N, d)      #   if Q > C  (chunk path, ~O(N * C * dim))
+            recurrent_attn_flops(N, d)  #   else      (token-by-token recurrence, O(N * dim))
+
+    ## Bytes (fused, recurrent state amortized)
+        linear_proj_weight_bytes(d)     # Q/K/V/Gate/Out projection weights
+      + conv_weight_bytes(d)            # conv1d weights + bias
+      + head_v_dim * es                 # RMSNormGated weight
+      + 2 * Nv * 4                      # A_log + dt_bias (fp32, tiny)
+      + state_io                        # state_bytes (always written) + (read if P > 0)
+      + conv_state_io                   # (K-1)-entry ring buffer, similar pattern
+      + N * H * es                      # activation read
+      + N * H * es                      # activation write
+
+    The state-and-conv-buffer terms are the only cache-aware bytes; both are
+    fixed size (do NOT grow with kv_cache_len). That's the math reason GDN
+    wins long-context decode — softmax attention's KV scales O(P), GDN
+    stays O(1).
     """
 
     def _check_in_shape(self, in_shape: tuple[int, ...]) -> tuple[int, int]:

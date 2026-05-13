@@ -157,13 +157,22 @@ def get_spec(name: str, *, strict: bool = False) -> RooflineSpec | None:
 class RMSNormSpec(RooflineSpec):
     """Spec for RMSNorm: ``y = x * rsqrt(mean(x**2) + eps) * weight``.
 
-    FLOPs: ~4 per element (square, mean accum, rsqrt+eps, mul-back-with-weight).
-    The constant is a tight approximation; matmul costs around it dominate by
-    100-1000x in normal LLM forward, so even a 2x error here is below the
-    noise floor.
+    Variables: N = total tokens (prod of all dims except the last),
+    H = hidden_size (last dim), es = dtype_size(dtype).
 
-    Bytes (optimal fusion): read input + read weight (small ``[H]`` vector) +
-    write output. No constructor args — reads ``hidden`` from ``in_shape[-1]``.
+    ## FLOPs
+        4 * N * H                       # square + mean-accum + rsqrt+eps + mul-w-weight
+
+    The 4-per-element constant is a tight approximation; the matmul costs
+    around RMSNorm dominate by 100-1000x in normal LLM forward, so a 2x
+    error here is below the noise floor.
+
+    ## Bytes (optimal fusion)
+          N * H * es                    # activation read
+        +     H * es                    # weight vector
+        + N * H * es                    # activation write
+
+    No constructor args — both dims read from ``in_shape``.
     """
 
     def flops(self, in_shape: tuple[int, ...], config=None, **kwargs) -> int:
@@ -185,17 +194,20 @@ class RMSNormSpec(RooflineSpec):
 
 
 class LinearSpec(RooflineSpec):
-    """Spec for a single ``nn.Linear`` projection.
+    """Spec for a single ``nn.Linear`` projection: ``y = x @ W + b``.
 
-    FLOPs: ``2 * batch_tokens * in_features * out_features`` (mul + add per
-    weight per token); bias adds ``batch_tokens * out_features`` extra adds,
-    typically negligible.
+    Variables: N = batch_tokens (prod of all dims except the last),
+    I = in_features, O = out_features, es = dtype_size(dtype).
 
-    Bytes (optimal fusion):
-      * weights:  ``in_features * out_features * dtype_size``
-      * bias:     ``out_features * dtype_size`` (when present)
-      * act_in:   ``batch_tokens * in_features * dtype_size``
-      * act_out:  ``batch_tokens * out_features * dtype_size``
+    ## FLOPs
+        2 * N * I * O                   # one MAC = 2 flops per weight per token
+      + N * O                           # bias add (when bias=True; usually negligible)
+
+    ## Bytes (optimal fusion, weights-once)
+          I * O * es                    # weight matrix
+        +     O * es                    # bias vector (when bias=True)
+        + N * I * es                    # activation read
+        + N * O * es                    # activation write
 
     Constructor args fix the projection dims so a ``LinearSpec`` instance
     describes one specific linear — model-specific composite specs build on

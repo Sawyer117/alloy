@@ -206,6 +206,49 @@ class DSV4AttentionSpec(RooflineSpec):
     ``flops`` / ``bytes`` accept ``kv_cache_len`` via ``**kwargs`` for
     mini-prefill / decode modes. Default ``kv_cache_len=0`` is the cold
     prefill path.
+
+    Variables: B = batch, Q = query_len, P = kv_cache_len, T = Q + P (total
+    seq), Nq = B * Q (new query tokens), H = hidden_size, qlr = q_lora_rank,
+    nh = num_attention_heads, hd = head_dim, og = o_groups, olr = o_lora_rank,
+    SW = min(T, sliding_window), nih = index_n_heads, ihd = index_head_dim,
+    rate_h = compress_rates["heavily_compressed_attention"],
+    rate_c = compress_rates["compressed_sparse_attention"],
+    es = dtype_size(dtype). DSV4 is MQA so kv_len here is the SINGLE shared
+    head; cached + new entries share the same KV buffer.
+
+    ## effective KV length per layer type
+        dsv4_sliding_attention : kv_len = SW
+        dsv4_hca_attention     : kv_len = SW + ceil(T / rate_h)
+        dsv4_csa_attention     : kv_len = SW + index_topk
+
+    ## FLOPs (Q/KV/O projections + main SDPA + per-layer-type extras)
+        2 * Nq * H * qlr                # q_a_proj (down)
+      + 2 * Nq * qlr * (nh * hd)        # q_b_proj (up)
+      + 2 * Nq * H * hd                 # kv_proj (MQA single head)
+      + 2 * Nq * (nh * hd) * olr        # o_a_proj (grouped, equiv flops)
+      + 2 * Nq * (og * olr) * H         # o_b_proj
+      + 4 * B * nh * Q * kv_len * hd    # main SDPA (Q × kv_len, multi-head)
+      [HCA extra]
+        + 4 * Q * H * hd                # compressor: kv_proj + gate_proj
+      [CSA extra]
+        + 4 * Q * H * (2 * hd)          # compressor: kv_proj + gate_proj (2*hd)
+        + 4 * Nq * H * (2 * ihd)        # indexer: kv_proj + gate_proj
+        + 2 * Nq * qlr * (nih * ihd)    # indexer: q_b_proj
+        + 2 * Nq * H * nih              # indexer: weights_proj
+        + 2 * B * Q * nih * ihd * ceil(T / rate_c)   # indexer: score matmul
+
+    ## Bytes (FlashAttention-style fusion; single MQA KV head materialized)
+        H*qlr*es + qlr*nh*hd*es + H*hd*es + nh*hd*olr*es + og*olr*H*es + nh*es
+            # Q/KV/O projection weights + per-head sinks [nh]
+      + Nq * H * es                     # activation read (new tokens)
+      + Nq * H * es                     # activation write (new tokens)
+      + B * kv_len * hd * es            # KV buffer (single shared head)
+      [HCA extra weights]
+        + 2 * H * hd * es + rate_h * hd * es + hd * es
+      [CSA extra weights]
+        + 2 * H * (2*hd) * es + rate_c * (2*hd) * es + hd * es   # compressor
+        + 2 * H * (2*ihd) * es + qlr * nih * ihd * es + H * nih * es
+            + rate_c * (2*ihd) * es + ihd * es                   # indexer
     """
 
     def __init__(self, layer_type: str) -> None:
@@ -325,6 +368,31 @@ class Qwen3AttentionSpec(RooflineSpec):
       * ``attention_bias=True`` — bias terms on q/k/v/o linears.
 
     Skipped in v1 (sub-1% combined): RMSNorm on q/k, RoPE.
+
+    Variables: B = batch, Q = query_len, P = kv_cache_len, Nq = B * Q,
+    H = hidden_size, nh = num_attention_heads, nkv = num_key_value_heads,
+    hd = head_dim, qd = nh*hd, kvd = nkv*hd, g = 2 if attn_output_gate
+    else 1, es = dtype_size(dtype). kv_len = min(Q+P, sliding_window) for
+    ``qwen3_attention_sliding``, else Q+P.
+
+    ## FLOPs
+        2 * Nq * H * (qd * g)           # q_proj (× g if attn_output_gate)
+      + 2 * Nq * H * kvd                # k_proj
+      + 2 * Nq * H * kvd                # v_proj
+      + 2 * Nq * qd * H                 # o_proj
+      + bias_flops                      # Nq * (qd*g + 2*kvd + H) if attention_bias
+      + 4 * B * nh * Q * kv_len * hd    # SDPA QK^T + AV (Q has nh heads, KV broadcast)
+      + 4 * Nq * qd                     # output gate sigmoid + mul (only if g=2)
+
+    ## Bytes (FlashAttention-style fusion; K and V are separate tensors)
+        H * (qd*g) * es                 # q_proj weights
+      + H * kvd * es * 2                # k_proj + v_proj weights
+      + qd * H * es                     # o_proj weights
+      + 2 * hd * es                     # q_norm + k_norm gain vectors
+      + bias_bytes                      # (qd*g + 2*kvd + H) * es if attention_bias
+      + Nq * H * es                     # activation read
+      + Nq * H * es                     # activation write
+      + B * 2 * nkv * kv_len * hd * es  # KV cache (K and V both materialized, GQA = nkv heads)
     """
 
     def __init__(self, layer_type: str) -> None:
