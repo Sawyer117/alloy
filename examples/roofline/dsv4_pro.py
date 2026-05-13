@@ -122,6 +122,13 @@ def build_v4_pro_config():
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=2.5,
 
+        # MHC (Manifold-constrained Hyper-Connections) — V4-Pro carries
+        # hc_mult=4 parallel residual streams and runs 20 Sinkhorn iters
+        # per HyperConnection site (2 sites per layer + 1 final HyperHead).
+        use_mhc=True,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+
         # Layer composition
         layer_types=layer_types,
         ffn_types=ffn_types,

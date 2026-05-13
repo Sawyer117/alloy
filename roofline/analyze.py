@@ -28,6 +28,7 @@ import torch
 
 from .hardware import Hardware, get_hardware
 from .specs import RMSNormSpec, dtype_size, get_spec
+from .specs_mhc import MhcHyperConnectionSpec, MhcHyperHeadSpec
 
 
 # --------------------------------------------------------------------------- #
@@ -282,7 +283,7 @@ class RooflineReport:
 
         groups: "OrderedDict[str, dict]" = OrderedDict()
         for m, t in zip(self.modules, [self._module_time_s(m) for m in self.modules]):
-            key = f"{m.kind}:{m.name}" if m.kind in ("mixer", "ffn") else m.name
+            key = f"{m.kind}:{m.name}" if m.kind in ("mixer", "ffn", "mhc") else m.name
             g = groups.setdefault(key, {"count": 0, "flops": 0, "bytes": 0, "time": 0.0,
                                        "compute_bound_count": 0, "memory_bound_count": 0})
             g["count"] += 1
@@ -432,7 +433,24 @@ def roofline(
             f"({len(ffn_types)}) length mismatch."
         )
 
+    # MHC residual machinery: when ``config.use_mhc=True``, every decoder
+    # layer wraps both sublayers in a ``_HyperConnection`` (collapse hc_mult
+    # streams to one, run sublayer, place back). The sublayer itself still
+    # sees [B, S, hidden] — that's why ``in_shape`` here stays single-stream.
+    # Cost is added per-layer as kind="mhc"; the final HyperHead collapse
+    # is added once after the loop.
+    use_mhc = bool(getattr(config, "use_mhc", False))
+    hc_spec = MhcHyperConnectionSpec() if use_mhc else None
+
     for i, (mixer_name, ffn_name) in enumerate(zip(layer_types, ffn_types)):
+        # MHC: per-layer pre-mixer HyperConnection
+        if hc_spec is not None:
+            report.modules.append(ModuleStat(
+                kind="mhc", name="hc_attn", layer_idx=i,
+                flops=hc_spec.flops(in_shape, config),
+                bytes=hc_spec.bytes(in_shape, config, dtype),
+            ))
+
         # Mixer
         spec = get_spec(mixer_name, strict=strict)
         if spec is None:
@@ -447,6 +465,14 @@ def roofline(
             ))
             in_shape = spec.out_shape(in_shape, config, **spec_kwargs)
 
+        # MHC: per-layer pre-ffn HyperConnection
+        if hc_spec is not None:
+            report.modules.append(ModuleStat(
+                kind="mhc", name="hc_ffn", layer_idx=i,
+                flops=hc_spec.flops(in_shape, config),
+                bytes=hc_spec.bytes(in_shape, config, dtype),
+            ))
+
         # FFN
         spec = get_spec(ffn_name, strict=strict)
         if spec is None:
@@ -460,6 +486,16 @@ def roofline(
                 bytes=spec.bytes(in_shape, config, dtype, **spec_kwargs),
             ))
             in_shape = spec.out_shape(in_shape, config, **spec_kwargs)
+
+    # MHC: final HyperHead collapse — single instance, NOT per-layer.
+    if use_mhc:
+        head_spec = MhcHyperHeadSpec()
+        head_in_shape = (batch, query_len, hidden)
+        report.modules.append(ModuleStat(
+            kind="mhc", name="hc_head", layer_idx=None,
+            flops=head_spec.flops(head_in_shape, config),
+            bytes=head_spec.bytes(head_in_shape, config, dtype),
+        ))
 
     # ---- Final RMSNorm: applied to the Q new tokens before lm_head. ------
     norm_spec = RMSNormSpec()

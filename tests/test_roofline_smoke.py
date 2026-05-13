@@ -491,6 +491,78 @@ def test_roofline_fail_open_marks_unknown():
 
 
 # --------------------------------------------------------------------------- #
+# MHC (Manifold-constrained Hyper-Connections) wiring
+# --------------------------------------------------------------------------- #
+
+
+def _mhc_test_config(*, use_mhc: bool, n_layers: int = 2):
+    """Tiny config with the smallest registered mixer + ffn names. We don't
+    care about the per-layer math here, only whether MHC adds the
+    ``mhc:hc_attn`` / ``mhc:hc_ffn`` / ``mhc:hc_head`` accounting rows."""
+    register_spec("_mhc_test_mixer", LinearSpec(in_features=64, out_features=64),
+                  override=True)
+    register_spec("_mhc_test_ffn", LinearSpec(in_features=64, out_features=64),
+                  override=True)
+    return SimpleNamespace(
+        hidden_size=64,
+        vocab_size=128,
+        num_hidden_layers=n_layers,
+        tie_word_embeddings=False,
+        layer_types=["_mhc_test_mixer"] * n_layers,
+        ffn_types=["_mhc_test_ffn"] * n_layers,
+        use_mhc=use_mhc,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+    )
+
+
+def test_mhc_off_no_residual_machinery() -> None:
+    """With ``use_mhc=False`` the analyzer must not emit any mhc:* rows."""
+    cfg = _mhc_test_config(use_mhc=False, n_layers=3)
+    report = roofline(cfg, batch=1, query_len=8, kv_cache_len=0, hardware="H100")
+    mhc_modules = [m for m in report.modules if m.kind == "mhc"]
+    assert mhc_modules == [], (
+        f"mhc rows should be absent when use_mhc=False; got {len(mhc_modules)}: "
+        f"{[m.name for m in mhc_modules]}"
+    )
+    print("[ok] use_mhc=False emits zero mhc:* rows")
+
+
+def test_mhc_on_emits_hc_per_layer_and_head_once() -> None:
+    """With ``use_mhc=True`` and N layers, expect:
+      * N ``mhc:hc_attn`` rows
+      * N ``mhc:hc_ffn`` rows
+      * exactly 1 ``mhc:hc_head`` row (post-loop, before final norm).
+    """
+    n = 5
+    cfg = _mhc_test_config(use_mhc=True, n_layers=n)
+    report = roofline(cfg, batch=1, query_len=8, kv_cache_len=0, hardware="H100")
+    by_name = {}
+    for m in (m for m in report.modules if m.kind == "mhc"):
+        by_name.setdefault(m.name, []).append(m)
+    assert len(by_name.get("hc_attn", [])) == n, f"expected {n} hc_attn rows, got {len(by_name.get('hc_attn', []))}"
+    assert len(by_name.get("hc_ffn", [])) == n, f"expected {n} hc_ffn rows, got {len(by_name.get('hc_ffn', []))}"
+    assert len(by_name.get("hc_head", [])) == 1, "exactly one hc_head row expected"
+    # All MHC rows must have nonzero flops + bytes; zero would mean the spec misfired.
+    for rows in by_name.values():
+        for r in rows:
+            assert r.flops > 0 and r.bytes > 0, f"mhc row {r.name} has zero flops/bytes"
+    print(f"[ok] use_mhc=True emits {n} hc_attn + {n} hc_ffn + 1 hc_head rows with nonzero costs")
+
+
+def test_mhc_on_strictly_more_flops_than_off() -> None:
+    """Toggling MHC on must add non-trivial total FLOPs and bytes — sanity
+    check that the spec values flow into the report totals."""
+    cfg_off = _mhc_test_config(use_mhc=False, n_layers=3)
+    cfg_on = _mhc_test_config(use_mhc=True, n_layers=3)
+    r_off = roofline(cfg_off, batch=1, query_len=8, kv_cache_len=0, hardware="H100")
+    r_on = roofline(cfg_on, batch=1, query_len=8, kv_cache_len=0, hardware="H100")
+    assert r_on.total_flops > r_off.total_flops, "MHC on should add FLOPs"
+    assert r_on.total_bytes > r_off.total_bytes, "MHC on should add bytes"
+    print("[ok] enabling MHC strictly grows total_flops and total_bytes")
+
+
+# --------------------------------------------------------------------------- #
 # Driver
 # --------------------------------------------------------------------------- #
 
@@ -518,6 +590,9 @@ def main() -> int:
     test_roofline_end_to_end()
     test_roofline_strict_missing_raises()
     test_roofline_fail_open_marks_unknown()
+    test_mhc_off_no_residual_machinery()
+    test_mhc_on_emits_hc_per_layer_and_head_once()
+    test_mhc_on_strictly_more_flops_than_off()
     print("\nAll roofline smoke tests passed.")
     return 0
 

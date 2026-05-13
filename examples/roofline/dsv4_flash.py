@@ -119,6 +119,12 @@ def build_v4_flash_config():
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
 
+        # MHC (Manifold-constrained Hyper-Connections) — same shape as Pro:
+        # hc_mult=4 parallel streams + 20 Sinkhorn iters per HyperConnection.
+        use_mhc=True,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+
         # Layer composition
         layer_types=layer_types,
         ffn_types=ffn_types,
