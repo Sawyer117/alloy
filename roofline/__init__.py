@@ -56,7 +56,14 @@ from .specs import (
 # binding specs to the same names used by register_ffn / register_mixer in
 # alloy.modules. Mirrors how alloy/__init__.py imports alloy.modules to
 # trigger mixer/ffn registration.
-from . import specs_attention, specs_ffn, specs_gdn  # noqa: F401
+from . import specs_attention, specs_ffn, specs_gdn, specs_dflash  # noqa: F401
+
+# Speculative-decoding (DFlash) helpers — built on top of specs_dflash.
+from .dflash import (
+    roofline_dflash_draft_forward,
+    roofline_dflash_speculation_round,
+    roofline_dflash_steady_throughput,
+)
 
 
 __all__ = [
@@ -87,4 +94,8 @@ __all__ = [
     "ASCEND_950PR",
     "PRESETS",
     "get_hardware",
+    # DFlash speculative decoding
+    "roofline_dflash_draft_forward",
+    "roofline_dflash_speculation_round",
+    "roofline_dflash_steady_throughput",
 ]
