@@ -217,8 +217,8 @@ def main() -> int:
     model_a = AlloyForCausalLM(cfg).to(device=device, dtype=dtype).eval()
     cap_a = _hook_layers(model_a)
     state_dict = {k: v.detach().clone() for k, v in model_a.state_dict().items()}
-    print(f"    layer_0 self_attn._csa_attn_fn = {getattr(model_a.model.layers[0].self_attn, '_csa_attn_fn', None)}")
-    print(f"    CSA layer self_attn._csa_attn_fn = {getattr(model_a.model.layers[cfg.layer_types.index('dsv4_csa_attention')].self_attn, '_csa_attn_fn', None)}")
+    print(f"    layer_0 self_attn._attn_fn = {getattr(model_a.model.layers[0].self_attn, '_attn_fn', None)}")
+    print(f"    CSA layer self_attn._attn_fn = {getattr(model_a.model.layers[cfg.layer_types.index('dsv4_csa_attention')].self_attn, '_attn_fn', None)}")
 
     with torch.no_grad():
         _ = model_a(input_ids=input_ids, use_cache=False)
@@ -243,7 +243,7 @@ def main() -> int:
         if missing:  print(f"    missing[:3]={missing[:3]}")
         if unexpected: print(f"    unexpected[:3]={unexpected[:3]}")
     cap_b = _hook_layers(model_b)
-    print(f"    CSA layer self_attn._csa_attn_fn = {getattr(model_b.model.layers[cfg.layer_types.index('dsv4_csa_attention')].self_attn, '_csa_attn_fn', None)}")
+    print(f"    CSA layer self_attn._attn_fn = {getattr(model_b.model.layers[cfg.layer_types.index('dsv4_csa_attention')].self_attn, '_attn_fn', None)}")
 
     with torch.no_grad():
         _ = model_b(input_ids=input_ids, use_cache=False)

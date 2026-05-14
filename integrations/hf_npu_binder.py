@@ -26,7 +26,10 @@ from hf_npu_binder.qwen3_5_moe import (
     experts as _hf_experts,
     fused_recurrent_gated_delta_rule as _hf_recurrent_gdr,
 )
-from hf_npu_binder.deepseek_v4 import sparse_flash_attention as _hf_sfa
+from hf_npu_binder.deepseek_v4 import (
+    compressed_attention as _hf_compressed,
+    sparse_flash_attention as _hf_sfa,
+)
 
 # alloy's own per-module dispatch table (GDN sub-functions live here).
 from alloy.modules.registry import DEFAULT_IMPL, register_implementation
@@ -64,19 +67,36 @@ _HF_EXPERTS_BINDINGS: tuple[tuple[str, object], ...] = (
     ("flash", _hf_experts.flash),
 )
 
-# DSV4 CSA SFA. Two backends now wired:
+# DSV4 attention. Three dispatch surfaces — one per layer type — share
+# the same vendored MindSpeed SparseFlashAttentionTriton kernel under
+# the hood; they differ only in topk_idxs construction (see the binder
+# adapters for details):
+#
+#   * CSA  (``dsv4_csa.attention``)     — sliding ++ Lightning-Indexer picks
+#   * HCA  (``dsv4_hca.attention``)     — sliding ++ all-compressed-positions
+#   * Sliding (``dsv4_sliding.attention``) — sliding only
+#
+# CSA has two backends:
 #   * ``triton`` — vendored MindSpeed kernel + BHSD-to-SBND adapter with
 #     combined-topk construction. Works on any CANN that supports
 #     triton-ascend (no aclnn op dependency). Default under "auto".
 #   * ``ascendc`` — CANN's ``aclnnSparseAttnSharedkv``, requires the op
 #     to exist in ``libopapi.so`` (CANN 9.0.0 release+; 9.0.0-beta.1
 #     is missing the symbol). Explicit opt-in via DEFAULTS / activate.
-# The ``flash`` intent maps to ``triton`` in DEFAULTS — there is no
-# dedicated flash CSA backend — so a single ``activate(model, "flash")``
-# call still gets the fast path on DSV4 layers.
+#
+# HCA / sliding share the ``compressed_attention.triton`` adapter (one
+# entry, picks sliding-only vs HCA path by inspecting ``compressed_seq_len``).
+# No ascendc backend yet — that's a future port (aclnnSparseAttnSharedkv
+# without sparse indices); ascendc intent falls back to torch per DEFAULTS.
+#
+# The ``flash`` intent maps to ``triton`` in DEFAULTS (no flash kernels
+# for DSV4 attention), so a single ``activate(model, "flash")`` call
+# still gets the fast path on every layer type.
 _DEEPSEEK_V4_BINDINGS: tuple[tuple[str, str, object], ...] = (
-    ("dsv4_csa.attention", "triton",  _hf_sfa.triton),
-    ("dsv4_csa.attention", "ascendc", _hf_sfa.ascendc),
+    ("dsv4_csa.attention",     "triton",  _hf_sfa.triton),
+    ("dsv4_csa.attention",     "ascendc", _hf_sfa.ascendc),
+    ("dsv4_hca.attention",     "triton",  _hf_compressed.triton),
+    ("dsv4_sliding.attention", "triton",  _hf_compressed.triton),
 )
 
 # Config field names that ``activate(prefer="<backend>")`` will broadcast a
@@ -109,7 +129,13 @@ def _register_all() -> None:
     for alloy_key, impl_name, fn in _DEEPSEEK_V4_BINDINGS:
         register_implementation(alloy_key, impl_name, fn, override=True)
     _ACTIVATABLE_FIELDS.append(
-        ("_dsv4_csa_implementation", "deepseek_v4.sparse_flash_attention")
+        ("_dsv4_csa_implementation",     "deepseek_v4.sparse_flash_attention")
+    )
+    _ACTIVATABLE_FIELDS.append(
+        ("_dsv4_hca_implementation",     "deepseek_v4.compressed_attention")
+    )
+    _ACTIVATABLE_FIELDS.append(
+        ("_dsv4_sliding_implementation", "deepseek_v4.compressed_attention")
     )
 
     # Per-bare-module-key default impl, consulted by alloy modules when
@@ -123,6 +149,12 @@ def _register_all() -> None:
     )
     DEFAULT_IMPL["dsv4_csa"] = _resolve_intent(
         binder_defaults, "deepseek_v4.sparse_flash_attention", "auto",
+    )
+    DEFAULT_IMPL["dsv4_hca"] = _resolve_intent(
+        binder_defaults, "deepseek_v4.compressed_attention", "auto",
+    )
+    DEFAULT_IMPL["dsv4_sliding"] = _resolve_intent(
+        binder_defaults, "deepseek_v4.compressed_attention", "auto",
     )
 
 
@@ -204,13 +236,17 @@ def activate(model, prefer: str | Mapping[str, str]) -> dict[str, str]:
         >>> activate(model, "auto")  # binder picks the best per operator
         {'_qwen3_5_gdn_implementation': 'triton',
          '_experts_implementation': 'flash',
-         '_dsv4_csa_implementation': 'torch'}        # SFA kernel pending
-        >>> activate(model, "flash")  # broadcast; DSV4 has no flash, falls back
-        {'_qwen3_5_gdn_implementation': 'flash',
+         '_dsv4_csa_implementation': 'triton',
+         '_dsv4_hca_implementation': 'triton',
+         '_dsv4_sliding_implementation': 'triton'}
+        >>> activate(model, "ascendc")  # CSA uses aclnnSparseAttnSharedkv, HCA/sliding fall back to torch
+        {'_qwen3_5_gdn_implementation': 'triton',  # qwen3_5_gdn doesn't have ascendc; DEFAULTS falls back
          '_experts_implementation': 'flash',
-         '_dsv4_csa_implementation': 'torch'}
-        >>> activate(model, {"qwen3_5_gdn": "torch"})  # explicit override
-        {'_qwen3_5_gdn_implementation': 'torch'}
+         '_dsv4_csa_implementation': 'ascendc',
+         '_dsv4_hca_implementation': 'torch',     # no ascendc port yet
+         '_dsv4_sliding_implementation': 'torch'}
+        >>> activate(model, {"dsv4_csa": "torch"})  # explicit per-module override
+        {'_dsv4_csa_implementation': 'torch'}
     """
     if not hasattr(model, "config"):
         raise TypeError(

@@ -1,41 +1,54 @@
-"""Binder ON vs OFF for DeepSeek-V4 CSA — precision + speed on alloy.
+"""Binder ON vs OFF for DeepSeek-V4 — precision + speed on alloy.
 
 DSV4-specific sibling of ``compare_binder_vs_torch.py``. Builds a small
-alloy DSV4 model with at least one ``dsv4_csa_attention`` layer (the
-only DSV4 attention flavour the binder currently fast-paths), then
-forwards the same input twice:
+alloy DSV4 model whose ``layer_types`` pattern covers all three DSV4
+attention flavours (``dsv4_hca_attention``, ``dsv4_csa_attention``,
+``dsv4_sliding_attention``), then forwards the same input twice:
 
-  1. **OFF (baseline)** — default dispatch. ``dsv4_csa.attention``
-     resolves to alloy's ``_torch_csa_attention`` (eager attention +
-     scatter-bias mask). This is the byte-exact reference path on this
-     hardware.
+  1. **OFF (baseline)** — every DSV4 attention dispatch surface is
+     pinned to alloy's torch impl (``_torch_dsv4_attention`` →
+     ``_eager_attention_with_sinks``). This is the byte-exact
+     reference path on this hardware.
 
-  2. **ON (binder triton)** — ``activate(model, prefer="triton")``
-     flips ``_dsv4_csa_implementation`` to ``"triton"`` so the CSA
-     attention call dispatches to
-     ``hf_npu_binder.deepseek_v4.sparse_flash_attention.triton`` (BHSD
-     adapter over the vendored MindSpeed SFA kernel). HCA / sliding
-     / MoE layers continue using alloy's torch fallback — only CSA
-     swaps backends.
+  2. **ON (binder)** — ``activate(model, prefer=<backend>, target=<set>)``
+     flips the ``_dsv4_{csa,hca,sliding}_implementation`` fields named
+     in ``--target`` (default ``all``) to the chosen backend so those
+     layer types dispatch to the binder fast path. Untargeted layer
+     types stay on torch so the diff isolates the layer types under
+     test.
 
-The diff between the two logit outputs is the **CSA fast-path drift**;
-in bf16 we expect it to sit in the accumulation-order noise floor
-(~1e-3 to 1e-2 max_abs). Same hardware, same random weights, same
-input — the only thing that changes is the CSA attention impl, so any
+The diff between the two logit outputs is the **fast-path drift** for
+the targeted layer types; in bf16 we expect it in the accumulation-
+order noise floor (~1e-3 to 1e-2 max_abs). Same hardware, same random
+weights, same input — only the chosen attention impl(s) change, so any
 larger drift is a wrapper bug.
 
-Shape constraint: the binder's triton adapter only supports total
-topk widths in ``CONFIG_MAP`` ``{128, 160, 640}``. ``sliding_window +
-index_topk`` must land on one of these. Defaults (128 + 32 = 160) do.
+Shape constraint: the binder triton adapters share the SFA kernel's
+``CONFIG_MAP`` ``{128, 160, 640}`` for total topk width.
+
+  * Sliding-only: ``sliding_window`` must hit one of those values.
+  * CSA: ``sliding_window + index_topk`` must hit one of those.
+  * HCA: ``sliding_window + ceil(seq_len / compress_rate_hca)`` must hit
+    one of those.
+
+Default config (W=128, index_topk=32, compress_rate_hca=8, seq_len=128)
+gives CSA=160 and HCA=128+16=144 — HCA misses CONFIG_MAP at this
+default. Either widen seq_len so HCA lands (e.g. seq=4096 with
+compress_rate_hca=128 → 128+32=160) or pass ``--target csa,sliding`` to
+skip HCA on default settings.
 
 Skipped cleanly if ``torch_npu`` or ``hf_npu_binder`` is not installed.
 
 Usage::
 
+    # Default: all three layer types compared against torch
     python -m alloy.tests.npu.compare_dsv4_binder_vs_torch \\
         --num-layers 4 --dtype bf16 --n-repeat 5
 
-    # Also try the ascendc path (requires CANN with aclnnSparseAttnSharedkv):
+    # Only CSA (matches old behavior):
+    python -m alloy.tests.npu.compare_dsv4_binder_vs_torch --target csa
+
+    # Try the ascendc CSA path (HCA / sliding stay torch via DEFAULTS):
     python -m alloy.tests.npu.compare_dsv4_binder_vs_torch --prefer ascendc
 """
 from __future__ import annotations
@@ -215,6 +228,13 @@ def main() -> int:
              "MindSpeed kernel via BHSD adapter; 'ascendc' is CANN's "
              "aclnnSparseAttnSharedkv (requires the op in libopapi.so).",
     )
+    parser.add_argument(
+        "--target", default="all",
+        help="comma-separated subset of {csa,hca,sliding,all} for which "
+             "layer types to swap to the binder backend. Untargeted layer "
+             "types stay pinned to torch on both phases so the diff "
+             "isolates the targeted layers. Default 'all'.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-warmup", type=int, default=2)
     parser.add_argument("--n-repeat", type=int, default=5)
@@ -230,12 +250,37 @@ def main() -> int:
           f"seq_len={args.seq_len}  sliding_window={args.sliding_window}  index_topk={args.index_topk}")
 
     cfg = _build_config(args)
-    csa_layers = sum(1 for lt in cfg.layer_types if lt == "dsv4_csa_attention")
-    if csa_layers == 0:
-        print(f"SKIP - no dsv4_csa_attention layers in the chosen pattern "
-              f"(layer_types={cfg.layer_types}); nothing for binder to fast-path.")
+
+    # Parse --target into a normalised set of layer-type keys
+    _ALL_TARGETS = {"csa", "hca", "sliding"}
+    raw = [t.strip() for t in args.target.split(",") if t.strip()]
+    if "all" in raw:
+        targets = set(_ALL_TARGETS)
+    else:
+        unknown = set(raw) - _ALL_TARGETS
+        if unknown:
+            print(f"ERROR - --target contains unknown entries {sorted(unknown)}; "
+                  f"choose from {sorted(_ALL_TARGETS)} or 'all'.")
+            return 2
+        targets = set(raw)
+    print(f"binder targets for this run: {sorted(targets)}")
+
+    # Layer-type populations (per chosen layer_types pattern). If none of
+    # the targeted layer types appear, nothing meaningful gets compared.
+    _LAYER_TYPE_BY_TARGET = {
+        "csa":     "dsv4_csa_attention",
+        "hca":     "dsv4_hca_attention",
+        "sliding": "dsv4_sliding_attention",
+    }
+    counts = {t: sum(1 for lt in cfg.layer_types if lt == _LAYER_TYPE_BY_TARGET[t])
+              for t in _ALL_TARGETS}
+    targeted_count = sum(counts[t] for t in targets)
+    if targeted_count == 0:
+        print(f"SKIP - no targeted layer types present "
+              f"(layer_types={cfg.layer_types}, targets={sorted(targets)}, "
+              f"counts={counts}); nothing for binder to fast-path.")
         return 0
-    print(f"CSA layers in this run: {csa_layers}/{args.num_layers}")
+    print(f"layer counts: {counts}  →  {targeted_count}/{args.num_layers} swapped")
 
     torch.manual_seed(args.seed)
     # Generate on CPU then move — some CANN releases route a direct
@@ -244,18 +289,18 @@ def main() -> int:
     input_ids = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len)).to(device)
 
     # =========================================================================
-    # Phase 1: BASELINE — explicitly force CSA to torch dispatch
+    # Phase 1: BASELINE — pin ALL three DSV4 attention surfaces to torch
     # =========================================================================
-    # Importing the binder bridge sets ``DEFAULT_IMPL["dsv4_csa"]`` to whatever
-    # binder DEFAULTS' "auto" entry resolves to (currently "triton"). Without
-    # an explicit override the baseline would ALSO pick up triton — turning
-    # the whole comparison into "triton vs triton" with the same callable
-    # serving both phases, which makes the diff a kernel-determinism probe
-    # rather than a wrapper-correctness probe. Force torch here so the
-    # baseline is alloy's _torch_csa_attention (byte-correct against HF).
-    cfg._dsv4_csa_implementation = "torch"
+    # Importing the binder bridge sets ``DEFAULT_IMPL["dsv4_{csa,hca,sliding}"]``
+    # to whatever binder DEFAULTS' "auto" resolves to (currently "triton" for
+    # all three). Without an explicit override the baseline would ALSO pick
+    # up the binder kernels — turning the whole comparison into "triton vs
+    # triton" with the same callable serving both phases. Force torch here
+    # so the baseline is alloy's _torch_dsv4_attention (byte-correct against HF).
+    for t in _ALL_TARGETS:
+        setattr(cfg, f"_dsv4_{t}_implementation", "torch")
     print("\n" + "=" * 70)
-    print("[baseline] alloy default (CSA -> _torch_csa_attention)")
+    print("[baseline] alloy default (all DSV4 attention -> _torch_dsv4_attention)")
     torch.manual_seed(args.seed)
     baseline_model = AlloyForCausalLM(cfg).to(device=device, dtype=dtype)
     baseline_logits, t_first_off, t_avg_off = _measure(
@@ -271,25 +316,23 @@ def main() -> int:
         torch.npu.empty_cache()
 
     # =========================================================================
-    # Phase 2: BINDER — activate(prefer="triton") before constructing the model
+    # Phase 2: BINDER — flip targeted layer types to args.prefer; rest stay torch
     # =========================================================================
     print("\n" + "=" * 70)
-    print(f"[binder]   activating prefer={args.prefer!r}")
+    print(f"[binder]   activating prefer={args.prefer!r} on targets={sorted(targets)}")
     # deepcopy so _attn_implementation (and any other underscore-prefixed
     # runtime hint) survives — AlloyConfig.to_dict() drops underscore fields
     # by design (so they don't leak into config.json), but for within-process
-    # cloning we WANT them: stripping _attn_implementation makes cfg_b's
-    # HCA/sliding layers default to whatever HF auto-picks (often sdpa,
-    # which doesn't honour DSV4's sinks kwarg), so layer-0 already diverges
-    # from cfg before the CSA layer is reached.
+    # cloning we WANT them.
     cfg_b = copy.deepcopy(cfg)
     fake = type("Model", (), {"config": cfg_b})()
-    # Use the mapping form so we only touch the dsv4_csa surface. The
+    # Map form: flip ONLY the targeted dsv4_{csa,hca,sliding} surfaces. The
     # string-broadcast form would also flip _qwen3_5_gdn_implementation
     # and _experts_implementation (neither relevant for this DSV4 model;
-    # the experts flip in particular is the one that has caused HF's
+    # the experts flip in particular has caused HF's
     # _check_and_adjust_experts_implementation to reject the value).
-    chosen = binder.activate(fake, prefer={"dsv4_csa": args.prefer})
+    prefer_map = {f"dsv4_{t}": args.prefer for t in targets}
+    chosen = binder.activate(fake, prefer=prefer_map)
     print(f"[binder]   activate() set: {chosen}")
 
     torch.manual_seed(args.seed)
@@ -320,8 +363,8 @@ def main() -> int:
         print(f"  {k:14s} {v:.6e}")
 
     print("\n=== Speed (avg over n-repeat) ===")
-    print(f"  baseline (torch CSA):       {t_avg_off*1000:.2f} ms")
-    print(f"  binder ({args.prefer}):     {t_avg_on*1000:.2f} ms")
+    print(f"  baseline (all-torch DSV4):  {t_avg_off*1000:.2f} ms")
+    print(f"  binder ({args.prefer} on {sorted(targets)}):  {t_avg_on*1000:.2f} ms")
     if t_avg_on > 0:
         speedup = t_avg_off / t_avg_on
         print(f"  speedup:                    {speedup:.2f}x")

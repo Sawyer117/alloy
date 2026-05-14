@@ -33,7 +33,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from transformers.cache_utils import Cache, DynamicSlidingWindowLayer
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from ..registry import get_implementation, register_implementation, register_mixer
 from ..shared.attention_kernels import repeat_kv
@@ -225,9 +224,17 @@ class DeepseekV4HCACompressor(nn.Module):
     window position (``i * compress_rate_hca + first_window_position``) so
     cross-call concatenation stays causality-correct.
 
-    Returns the running list of *all* compressed entries emitted so far
-    (shape ``[B, 1, T, head_dim]``), so the attention can attend over the
-    full long-range history.
+    Returns ``(compressed_kv, block_bias, None)`` where:
+
+      * ``compressed_kv`` ``[B, 1, T, head_dim]`` is the running list of all
+        compressed entries emitted so far.
+      * ``block_bias`` ``[B, 1, S, T]`` is the per-query causal mask over
+        the compressed axis: query at position ``p`` sees compressed entry
+        ``w`` only if ``w < (p + 1) // compress_rate``. ``None`` for the
+        decode case (``S == 1``) or empty (``T == 0``) — caller falls back
+        to zero-pad which is then also correct.
+      * 3rd slot is ``None`` (HCA has no Lightning Indexer); kept so the
+        caller's 3-tuple unpack stays uniform with CSA.
 
     Stateless mode (``past_key_values is None``): compress every complete
     window from ``hidden_states`` and discard the remainder.
@@ -252,7 +259,7 @@ class DeepseekV4HCACompressor(nn.Module):
         position_ids: torch.Tensor,
         past_key_values: Cache | None,
         layer_idx: int,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, None]:
         batch, _, _ = hidden_states.shape
         cache_layer: DeepseekV4HCACache = (
             past_key_values.layers[layer_idx] if past_key_values is not None else None
@@ -285,9 +292,30 @@ class DeepseekV4HCACompressor(nn.Module):
 
         if cache_layer is not None:
             compressed = cache_layer.update_compressor_states("compressor", compressed)
-        # HCA has no Lightning Indexer; the third slot is None so the caller's
-        # 3-tuple unpack is uniform with CSA.
-        return compressed.unsqueeze(1), None, None
+        compressed_kv = compressed.unsqueeze(1)
+
+        # Causal block bias over the compressed axis: query at position `p`
+        # may only see compressed entry `w` if all tokens in window `w` are
+        # already past — i.e. `w * compress_rate < p + 1`, equivalently
+        # `w < (p + 1) // compress_rate`. Everything else gets `-inf` so the
+        # downstream softmax drops it. Matches HF main's HCA causality fix
+        # (Arthur 5/11 ``ac372e10f2``); previous version had this slot as
+        # ``None`` and let the caller pad with ``0.0``, which made HCA
+        # non-causal in prefill (every query saw every compressed entry).
+        # Third tuple slot is ``None`` (HCA has no Lightning Indexer) so the
+        # caller's 3-tuple unpack stays uniform with CSA.
+        compressed_len = compressed_kv.shape[2]
+        seq_len = position_ids.shape[1]
+        if seq_len == 1 or compressed_len == 0:
+            return compressed_kv, None, None
+        entry_indices = torch.arange(compressed_len, device=compressed_kv.device)
+        causal_threshold = (position_ids + 1) // self.compress_rate  # [B, S]
+        block_bias = compressed_kv.new_zeros((batch, 1, seq_len, compressed_len))
+        block_bias = block_bias.masked_fill(
+            entry_indices.view(1, 1, 1, -1) >= causal_threshold.unsqueeze(1).unsqueeze(-1),
+            float("-inf"),
+        )
+        return compressed_kv, block_bias, None
 
 
 class DeepseekV4Indexer(nn.Module):
@@ -559,8 +587,10 @@ def _eager_attention_with_sinks(
     softmax sees the regular logits *plus* a synthetic sink logit per
     head; the sink is dropped from the output but its presence "absorbs"
     a configurable fraction of attention mass, which the paper argues
-    stabilizes very long-context behavior. Used as the fallback when
-    ``config._attn_implementation`` falls through ``ALL_ATTENTION_FUNCTIONS``.
+    stabilizes very long-context behavior. Bypasses HF's
+    ``ALL_ATTENTION_FUNCTIONS`` since sinks aren't part of HF's eager /
+    sdpa / flash signatures; the wrapper :func:`_torch_dsv4_attention`
+    is what gets registered into ``IMPL_REGISTRY``.
     """
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -590,30 +620,38 @@ _COMPRESSOR_CLASSES: dict[str, type | None] = {
 
 
 # =========================================================================== #
-# CSA-specific attention dispatch surface
+# Per-layer-type attention dispatch surfaces
 # =========================================================================== #
 #
-# CSA layers want their attention call to be replaceable by accelerator
-# kernels (NPU SFA Triton, etc.) without touching HF's generic
-# ``ALL_ATTENTION_FUNCTIONS``. HCA / sliding layers continue to route through
-# HF's interface for ``_attn_implementation`` ("eager" / "sdpa" / "flash"); the
-# CSA branch goes through alloy's ``IMPL_REGISTRY`` instead, so external
-# fast-path packages (e.g. ``hf-npu-binder``) can register a ``"triton"`` impl
-# under ``"dsv4_csa.attention"`` without rebuilding HF's attention machinery.
+# All three DSV4 attention flavours (sliding / HCA / CSA) route their
+# attention call through alloy's ``IMPL_REGISTRY`` so that accelerator
+# kernels (NPU SFA Triton, ascendc fused ops, ...) can swap in per-layer-type
+# without touching HF's generic ``ALL_ATTENTION_FUNCTIONS``. Each layer type
+# has its own registry key so a backend can ship different kernels for them
+# (e.g. CSA needs the Lightning-Indexer-aware SFA kernel; HCA / sliding use a
+# topk kernel that does not consume indexer output).
 #
-# Contract: same signature as HF's eager attention, plus two CSA-only kwargs
-# threaded through ``**kwargs``:
+# Registry keys:
+#   ``dsv4_sliding.attention`` — pure sliding window, no compressor
+#   ``dsv4_hca.attention``     — sliding + heavily-compressed KV (no indexer)
+#   ``dsv4_csa.attention``     — sliding + compressed KV + Lightning Indexer
 #
-#   ``csa_topk_idxs``       — [B, S, K] indexer output (``-1`` sentinels for
-#                             early-query invalid picks). The torch fallback
-#                             ignores it (uses ``attention_mask`` directly,
-#                             which already encodes the per-query bias);
-#                             kernel-side impls that want raw indices read it.
-#   ``compressed_seq_len``  — int T, the length of the compressed-KV segment
-#                             on the seq axis. Useful for kernels that need to
-#                             split sliding-window KV from compressed KV.
+# Contract: same signature as HF's eager attention, plus three kwargs
+# threaded through ``**kwargs`` that kernel-side impls may consume:
 #
-def _torch_csa_attention(
+#   ``csa_topk_idxs``       — [B, S, K] indexer output (CSA only;
+#                             ``-1`` sentinels for early-query invalid picks).
+#                             ``None`` for HCA / sliding. Torch impls ignore
+#                             it and use ``attention_mask`` directly.
+#   ``compressed_seq_len``  — int T, length of the compressed-KV segment on
+#                             the seq axis. ``0`` for sliding-only. Kernels
+#                             that need to split sliding-window KV from
+#                             compressed KV read this.
+#   ``sliding_window``      — int W, sliding window width. Used by kernels
+#                             that materialise the sliding mask as topk
+#                             indices.
+#
+def _torch_dsv4_attention(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -623,14 +661,14 @@ def _torch_csa_attention(
     dropout: float | int = 0.0,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """torch reference impl of CSA attention.
+    """torch reference impl shared by all three DSV4 attention flavours.
 
     Body delegates to :func:`_eager_attention_with_sinks` — the per-query
-    scatter-bias is already encoded in ``attention_mask`` (built by
-    :class:`DeepseekV4CSACompressor`), so the eager path is byte-exact
-    correct on its own. Kept as a separate registered callable so that
-    backend packages can swap in faster kernels under the same key without
-    perturbing HCA / sliding layers.
+    sliding mask + optional CSA scatter-bias is already encoded in
+    ``attention_mask`` (built by the layer's compressor when present), so
+    the eager path is byte-exact correct on its own. Kept as a separately
+    registered callable per layer type so backend packages can swap in
+    faster kernels under each key without affecting siblings.
     """
     return _eager_attention_with_sinks(
         module, query, key, value, attention_mask,
@@ -638,7 +676,19 @@ def _torch_csa_attention(
     )
 
 
-register_implementation("dsv4_csa.attention", "torch", _torch_csa_attention)
+register_implementation("dsv4_csa.attention",     "torch", _torch_dsv4_attention)
+register_implementation("dsv4_hca.attention",     "torch", _torch_dsv4_attention)
+register_implementation("dsv4_sliding.attention", "torch", _torch_dsv4_attention)
+
+
+# Mapping from layer-type name (used in ``config.layer_types[i]``) to the
+# IMPL_REGISTRY module key. Single source of truth for the three dispatch
+# surfaces; ``__init__`` reads this when resolving ``self._attn_fn``.
+_LAYER_TYPE_TO_REGISTRY_KIND: dict[str, str] = {
+    "dsv4_sliding_attention": "dsv4_sliding",
+    "dsv4_hca_attention":     "dsv4_hca",
+    "dsv4_csa_attention":     "dsv4_csa",
+}
 
 
 # =========================================================================== #
@@ -707,23 +757,21 @@ class DeepseekV4Attention(nn.Module):
         compressor_cls = _COMPRESSOR_CLASSES.get(self.layer_type)
         self.compressor = compressor_cls(config) if compressor_cls is not None else None
 
-        # CSA layers route their attention call through alloy's IMPL_REGISTRY
-        # so a backend package (hf-npu-binder, etc.) can register a faster
-        # ``"triton"`` impl under ``"dsv4_csa.attention"`` without affecting
-        # HCA / sliding layers (which keep going through HF's
-        # ``ALL_ATTENTION_FUNCTIONS`` for ``_attn_implementation`` selection).
-        # The torch default is registered at module-import time.
-        self._csa_attn_fn: Callable | None = None
-        if self.layer_type == "dsv4_csa_attention":
-            from ..registry import DEFAULT_IMPL
-            csa_impl = getattr(
-                config,
-                "_dsv4_csa_implementation",
-                DEFAULT_IMPL.get("dsv4_csa", "torch"),
-            )
-            self._csa_attn_fn = get_implementation(
-                "dsv4_csa.attention", csa_impl, fallback="torch",
-            )
+        # All three DSV4 attention flavours dispatch through alloy's
+        # IMPL_REGISTRY so backend packages (hf-npu-binder, etc.) can swap
+        # in faster kernels per layer type without touching HF's
+        # ``ALL_ATTENTION_FUNCTIONS``. Each layer type's torch default is
+        # registered at module-import time; the bridge adds triton /
+        # ascendc / etc. impls under the same keys.
+        from ..registry import DEFAULT_IMPL
+        kind = _LAYER_TYPE_TO_REGISTRY_KIND[self.layer_type]
+        impl_name = getattr(
+            config, f"_{kind}_implementation",
+            DEFAULT_IMPL.get(kind, "torch"),
+        )
+        self._attn_fn: Callable = get_implementation(
+            f"{kind}.attention", impl_name, fallback="torch",
+        )
 
     def forward(
         self,
@@ -775,41 +823,35 @@ class DeepseekV4Attention(nn.Module):
                     [attention_mask, compressed_bias.to(attention_mask.dtype)], dim=-1
                 )
 
-        if self._csa_attn_fn is not None:
-            # CSA layer: dispatch through alloy IMPL_REGISTRY. ``csa_topk_idxs``
-            # and ``compressed_seq_len`` are extra info that kernel-side impls
-            # may want; the torch fallback ignores them and reads the bias
-            # directly out of ``attention_mask``.
-            attn_output, attn_weights = self._csa_attn_fn(
-                self,
-                q,
-                kv,
-                kv,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                s_aux=self.sinks,
-                csa_topk_idxs=csa_topk_idxs,
-                compressed_seq_len=compressed_seq_len,
-                **kwargs,
-            )
-        else:
-            attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-                self.config._attn_implementation, _eager_attention_with_sinks
-            )
-            attn_output, attn_weights = attention_interface(
-                self,
-                q,
-                kv,
-                kv,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                s_aux=self.sinks,
-                **kwargs,
-            )
+        # All three layer types dispatch through alloy IMPL_REGISTRY (see
+        # __init__). Kernel-side impls may consume:
+        #   ``csa_topk_idxs``     [B, S, K] int32 — CSA-only Lightning-Indexer
+        #                         picks; None for HCA / sliding.
+        #   ``compressed_seq_len`` int T — length of compressed-KV tail on the
+        #                          seq axis. 0 for sliding-only.
+        #   ``position_ids``      [B, S] long — absolute positions, used by
+        #                          HCA kernels to build the causal-compress
+        #                          topk: query at position ``p`` may see
+        #                          compressed entry ``w`` only if
+        #                          ``w < (p + 1) // compress_rate_hca``.
+        # Torch fallback ignores these kwargs and reads ``attention_mask``
+        # directly (which already encodes the sliding + per-query block bias
+        # built upstream).
+        attn_output, attn_weights = self._attn_fn(
+            self,
+            q,
+            kv,
+            kv,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            sliding_window=self.sliding_window,
+            s_aux=self.sinks,
+            csa_topk_idxs=csa_topk_idxs,
+            compressed_seq_len=compressed_seq_len,
+            position_ids=position_ids,
+            **kwargs,
+        )
 
         # K=V in V4, so V picked up RoPE on its trailing rope slice. Apply
         # the conjugate rotation (-sin) at the query position to undo it on
