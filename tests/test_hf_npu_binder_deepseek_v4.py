@@ -160,16 +160,27 @@ def test_activate_writes_all_dsv4_fields() -> None:
     """``activate(model, prefer=...)`` covers all three DSV4 dispatch
     surfaces. Each one resolves through its own DEFAULTS entry — CSA
     has an ``ascendc`` option (separate aclnn op), HCA / sliding share
-    ``deepseek_v4.compressed_attention`` and only ship triton / torch."""
+    ``deepseek_v4.compressed_attention`` and only ship triton / torch.
+
+    Note on ``auto``: as of binder 0.0.4, ``auto`` for both DSV4
+    attention surfaces resolves to ``torch`` (not ``triton``) because
+    measured triton-ascend speed on toy configs isn't a win over
+    torch_npu eager and the wrapper adds bf16 drift. ``triton`` is the
+    explicit-opt-in intent for environments that want the kernel path;
+    ``ascendc`` is the genuine production fast path once CANN ships
+    aclnnSparseAttnSharedkv. See binder DEFAULTS for the rationale.
+    """
     # Each intent -> expected impl name per layer type
     expected_per_intent: dict[str, dict[str, str]] = {
         "auto": {
-            "_dsv4_csa_implementation":     "triton",
-            "_dsv4_hca_implementation":     "triton",
-            "_dsv4_sliding_implementation": "triton",
+            # auto -> torch on both attention surfaces (intentional;
+            # triton isn't a measured speed win and adds bf16 drift)
+            "_dsv4_csa_implementation":     "torch",
+            "_dsv4_hca_implementation":     "torch",
+            "_dsv4_sliding_implementation": "torch",
         },
         "flash": {
-            "_dsv4_csa_implementation":     "triton",   # no flash; falls back to triton
+            "_dsv4_csa_implementation":     "triton",   # no flash; triton is closest
             "_dsv4_hca_implementation":     "triton",
             "_dsv4_sliding_implementation": "triton",
         },

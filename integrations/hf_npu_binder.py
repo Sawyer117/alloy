@@ -236,9 +236,13 @@ def activate(model, prefer: str | Mapping[str, str]) -> dict[str, str]:
         >>> activate(model, "auto")  # binder picks the best per operator
         {'_qwen3_5_gdn_implementation': 'triton',
          '_experts_implementation': 'flash',
-         '_dsv4_csa_implementation': 'triton',
-         '_dsv4_hca_implementation': 'triton',
-         '_dsv4_sliding_implementation': 'triton'}
+         '_dsv4_csa_implementation': 'torch',
+         '_dsv4_hca_implementation': 'torch',
+         '_dsv4_sliding_implementation': 'torch'}
+        # DSV4 attention 'auto' = torch since triton-ascend isn't a measured
+        # speed win on these layers and adds bf16 drift (see binder DEFAULTS);
+        # use prefer='triton' explicitly to opt in, or prefer='ascendc' for
+        # the genuine CSA fast path once CANN ships aclnnSparseAttnSharedkv.
         >>> activate(model, "ascendc")  # CSA uses aclnnSparseAttnSharedkv, HCA/sliding fall back to torch
         {'_qwen3_5_gdn_implementation': 'triton',  # qwen3_5_gdn doesn't have ascendc; DEFAULTS falls back
          '_experts_implementation': 'flash',
