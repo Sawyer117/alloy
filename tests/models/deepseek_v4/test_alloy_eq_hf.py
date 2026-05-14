@@ -22,19 +22,15 @@ gating behavior.
 
 Usage::
 
-    python -m alloy.tests.compare_dsv4_random
-    python -m alloy.tests.compare_dsv4_random --dtype bf16
-    python -m alloy.tests.compare_dsv4_random --seq-len 64 --seed 7
+    pytest alloy/tests/models/deepseek_v4/test_alloy_eq_hf.py    # CI: fp32 byte-exact
+    python -m alloy.tests.models.deepseek_v4.test_alloy_eq_hf    # standalone CLI
+    python -m alloy.tests.models.deepseek_v4.test_alloy_eq_hf --dtype bf16
 """
 from __future__ import annotations
 
 import argparse
-import sys
-from pathlib import Path
 
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 
 # --------------------------------------------------------------------------- #
@@ -134,7 +130,7 @@ def _build_configs(attn_implementation: str = "eager"):
 # --------------------------------------------------------------------------- #
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"],
                         help="fp32 = byte-exact equivalence test; bf16 = noise floor probe.")
@@ -155,7 +151,7 @@ def main() -> int:
              "with sdpa even when the alloy port is algorithmically correct — "
              "exactly the production caveat to be aware of.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16}[args.dtype]
     device = torch.device(args.device)
@@ -228,6 +224,17 @@ def main() -> int:
               f"Observed drift: max_abs={diff.max().item():.4e}, "
               f"mean_abs={diff.mean().item():.4e}.")
         return 0
+
+
+def test_dsv4_alloy_eq_hf_fp32_byte_exact() -> None:
+    """Contract 1: alloy DSV4 port == HF reference, fp32 byte-exact on random weights."""
+    try:
+        from transformers.models import deepseek_v4  # noqa: F401
+    except ImportError:
+        import pytest
+
+        pytest.skip("HF transformers lacks deepseek_v4 (needs >=5.7)")
+    assert main([]) == 0
 
 
 if __name__ == "__main__":

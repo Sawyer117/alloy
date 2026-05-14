@@ -229,7 +229,7 @@ def _dtype_from_str(s: str) -> torch.dtype:
     return {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[s]
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--hidden-size", type=int, default=512)
@@ -278,7 +278,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-warmup", type=int, default=2)
     parser.add_argument("--n-repeat", type=int, default=5)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if _IMPORT_ERR is not None:
         print(f"SKIP - {_IMPORT_ERR}")
@@ -466,6 +466,15 @@ def main() -> int:
     print(f"  binder:    {t_first_on*1000:.2f} ms")
 
     return 0
+
+
+def test_dsv4_binder_auto_vs_torch_npu() -> None:
+    """Contract 2: alloy_torch ≈ binder(auto/triton) on NPU, bf16 noise floor."""
+    if _IMPORT_ERR is not None:
+        import pytest
+
+        pytest.skip(_IMPORT_ERR)
+    assert main([]) == 0
 
 
 if __name__ == "__main__":
