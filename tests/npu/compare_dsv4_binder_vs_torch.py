@@ -41,15 +41,39 @@ Skipped cleanly if ``torch_npu`` or ``hf_npu_binder`` is not installed.
 
 Usage::
 
-    # Default: all three layer types compared against torch
+    # Default: all three attention layer types swap to binder triton;
+    # MoE experts STAY on HF eager (so the perf number isn't skewed by
+    # the experts-flash speedup which is unrelated to attention).
     python -m alloy.tests.npu.compare_dsv4_binder_vs_torch \\
         --num-layers 4 --dtype bf16 --n-repeat 5
 
-    # Only CSA (matches old behavior):
+    # Just CSA
     python -m alloy.tests.npu.compare_dsv4_binder_vs_torch --target csa
+
+    # MoE experts only (binder flash via ALL_EXPERTS_FUNCTIONS["flash"]).
+    # Attention layers stay torch on both phases so the diff isolates
+    # the experts path.
+    python -m alloy.tests.npu.compare_dsv4_binder_vs_torch --target experts
+
+    # CSA + experts together
+    python -m alloy.tests.npu.compare_dsv4_binder_vs_torch --target csa,experts
 
     # Try the ascendc CSA path (HCA / sliding stay torch via DEFAULTS):
     python -m alloy.tests.npu.compare_dsv4_binder_vs_torch --prefer ascendc
+
+Targets:
+    csa / hca / sliding  — attention dispatch (alloy IMPL_REGISTRY ->
+                            binder triton). Pinning order: baseline pins
+                            ``_dsv4_{kind}_implementation = 'torch'``;
+                            binder phase flips targeted ones to args.prefer.
+    experts              — MoE experts forward (HF ALL_EXPERTS_FUNCTIONS
+                            via ``_experts_implementation``). Baseline pins
+                            to ``'eager'`` (HF's per-expert loop body);
+                            binder phase flips to ``'flash'`` (the binder
+                            shared ``moe_experts.flash`` chain of 4 ascendc
+                            fused ops + clamped npu_swiglu for DSV4).
+    all                  — equivalent to csa,hca,sliding (NOT experts;
+                            experts must be opted in explicitly).
 """
 from __future__ import annotations
 
@@ -230,10 +254,17 @@ def main() -> int:
     )
     parser.add_argument(
         "--target", default="all",
-        help="comma-separated subset of {csa,hca,sliding,all} for which "
-             "layer types to swap to the binder backend. Untargeted layer "
-             "types stay pinned to torch on both phases so the diff "
-             "isolates the targeted layers. Default 'all'.",
+        help="comma-separated subset of {csa,hca,sliding,experts,all} for "
+             "which surfaces to swap to the binder backend. csa / hca / "
+             "sliding swap the attention dispatch (per-layer-type triton "
+             "via alloy IMPL_REGISTRY); 'experts' swaps the MoE experts "
+             "forward (HF ALL_EXPERTS_FUNCTIONS via "
+             "_experts_implementation = 'flash'). Untargeted surfaces stay "
+             "pinned to torch / eager on both phases so the diff isolates "
+             "the targeted ones. Default 'all' covers attention only "
+             "(experts must be opted in explicitly since baseline = HF "
+             "eager loop is meaningfully slower than the flash path even "
+             "at small scale).",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-warmup", type=int, default=2)
@@ -251,36 +282,51 @@ def main() -> int:
 
     cfg = _build_config(args)
 
-    # Parse --target into a normalised set of layer-type keys
-    _ALL_TARGETS = {"csa", "hca", "sliding"}
+    # Parse --target into normalised sets:
+    #   ATTN_TARGETS  — subset of {csa, hca, sliding}; controls
+    #                   _dsv4_{kind}_implementation flips (alloy IMPL_REGISTRY)
+    #   moe_target    — bool; controls _experts_implementation flip
+    #                   (HF ALL_EXPERTS_FUNCTIONS). Routed via separate field
+    #                   because experts dispatch is HF-canonical, not
+    #                   per-layer-type.
+    _ALL_ATTN_TARGETS = {"csa", "hca", "sliding"}
+    _ALL_VALID = _ALL_ATTN_TARGETS | {"experts"}
     raw = [t.strip() for t in args.target.split(",") if t.strip()]
     if "all" in raw:
-        targets = set(_ALL_TARGETS)
+        # 'all' means all attention layer types; experts must be opted in
+        # explicitly so accidentally hitting it doesn't change the baseline
+        # cost reference.
+        attn_targets = set(_ALL_ATTN_TARGETS)
+        moe_target = False
     else:
-        unknown = set(raw) - _ALL_TARGETS
+        unknown = set(raw) - _ALL_VALID
         if unknown:
             print(f"ERROR - --target contains unknown entries {sorted(unknown)}; "
-                  f"choose from {sorted(_ALL_TARGETS)} or 'all'.")
+                  f"choose from {sorted(_ALL_VALID)} or 'all'.")
             return 2
-        targets = set(raw)
-    print(f"binder targets for this run: {sorted(targets)}")
+        attn_targets = set(raw) & _ALL_ATTN_TARGETS
+        moe_target = "experts" in raw
+    print(f"binder targets for this run: attn={sorted(attn_targets)}  experts={moe_target}")
 
-    # Layer-type populations (per chosen layer_types pattern). If none of
-    # the targeted layer types appear, nothing meaningful gets compared.
+    # Layer-type populations (per chosen layer_types pattern).
     _LAYER_TYPE_BY_TARGET = {
         "csa":     "dsv4_csa_attention",
         "hca":     "dsv4_hca_attention",
         "sliding": "dsv4_sliding_attention",
     }
     counts = {t: sum(1 for lt in cfg.layer_types if lt == _LAYER_TYPE_BY_TARGET[t])
-              for t in _ALL_TARGETS}
-    targeted_count = sum(counts[t] for t in targets)
-    if targeted_count == 0:
-        print(f"SKIP - no targeted layer types present "
-              f"(layer_types={cfg.layer_types}, targets={sorted(targets)}, "
-              f"counts={counts}); nothing for binder to fast-path.")
+              for t in _ALL_ATTN_TARGETS}
+    moe_layer_count = sum(1 for lt in cfg.ffn_types if "moe" in lt)
+    attn_targeted_count = sum(counts[t] for t in attn_targets)
+    if attn_targeted_count == 0 and not moe_target:
+        print(f"SKIP - no targeted surfaces present "
+              f"(layer_types={cfg.layer_types}, ffn_types={cfg.ffn_types}, "
+              f"attn={sorted(attn_targets)}, experts={moe_target}); "
+              f"nothing for binder to fast-path.")
         return 0
-    print(f"layer counts: {counts}  →  {targeted_count}/{args.num_layers} swapped")
+    print(f"layer counts: attn={counts}  moe_layers={moe_layer_count}  →  "
+          f"attn {attn_targeted_count}/{args.num_layers} swapped, "
+          f"experts {'flash on all' if moe_target else 'eager (untouched)'}")
 
     torch.manual_seed(args.seed)
     # Generate on CPU then move — some CANN releases route a direct
@@ -289,18 +335,22 @@ def main() -> int:
     input_ids = torch.randint(0, cfg.vocab_size, (args.batch_size, args.seq_len)).to(device)
 
     # =========================================================================
-    # Phase 1: BASELINE — pin ALL three DSV4 attention surfaces to torch
+    # Phase 1: BASELINE — pin DSV4 attention + MoE experts to their torch refs
     # =========================================================================
-    # Importing the binder bridge sets ``DEFAULT_IMPL["dsv4_{csa,hca,sliding}"]``
-    # to whatever binder DEFAULTS' "auto" resolves to (currently "triton" for
-    # all three). Without an explicit override the baseline would ALSO pick
-    # up the binder kernels — turning the whole comparison into "triton vs
-    # triton" with the same callable serving both phases. Force torch here
-    # so the baseline is alloy's _torch_dsv4_attention (byte-correct against HF).
-    for t in _ALL_TARGETS:
+    # Importing the binder bridge sets DEFAULT_IMPL entries to whatever binder
+    # DEFAULTS' "auto" resolves to (currently "triton" / "flash"). Without
+    # explicit override the baseline would ALSO pick up binder kernels and
+    # the whole comparison becomes "binder vs binder" — diff would only show
+    # kernel determinism, not wrapper correctness. Force torch / eager here.
+    for t in _ALL_ATTN_TARGETS:
         setattr(cfg, f"_dsv4_{t}_implementation", "torch")
+    # HF's experts dispatch validates against {"eager", "flash", "grouped_mm",
+    # "batched_mm", ...} — "torch" isn't a registered intent name there.
+    # "eager" runs HF's original _Experts.forward loop body (one expert at a
+    # time over selected tokens) — the meaningful torch baseline.
+    cfg._experts_implementation = "eager"
     print("\n" + "=" * 70)
-    print("[baseline] alloy default (all DSV4 attention -> _torch_dsv4_attention)")
+    print("[baseline] alloy default (attn -> _torch_dsv4_attention, experts -> HF eager)")
     torch.manual_seed(args.seed)
     baseline_model = AlloyForCausalLM(cfg).to(device=device, dtype=dtype)
     baseline_logits, t_first_off, t_avg_off = _measure(
@@ -316,22 +366,28 @@ def main() -> int:
         torch.npu.empty_cache()
 
     # =========================================================================
-    # Phase 2: BINDER — flip targeted layer types to args.prefer; rest stay torch
+    # Phase 2: BINDER — flip targeted surfaces to args.prefer; rest stay torch
     # =========================================================================
     print("\n" + "=" * 70)
-    print(f"[binder]   activating prefer={args.prefer!r} on targets={sorted(targets)}")
+    print(f"[binder]   activating prefer={args.prefer!r} on attn={sorted(attn_targets)}  experts={moe_target}")
     # deepcopy so _attn_implementation (and any other underscore-prefixed
     # runtime hint) survives — AlloyConfig.to_dict() drops underscore fields
     # by design (so they don't leak into config.json), but for within-process
     # cloning we WANT them.
     cfg_b = copy.deepcopy(cfg)
     fake = type("Model", (), {"config": cfg_b})()
-    # Map form: flip ONLY the targeted dsv4_{csa,hca,sliding} surfaces. The
-    # string-broadcast form would also flip _qwen3_5_gdn_implementation
-    # and _experts_implementation (neither relevant for this DSV4 model;
-    # the experts flip in particular has caused HF's
-    # _check_and_adjust_experts_implementation to reject the value).
-    prefer_map = {f"dsv4_{t}": args.prefer for t in targets}
+    # Map form: flip ONLY the targeted surfaces. The string-broadcast form
+    # would touch every activatable field; explicit mapping is safer.
+    prefer_map: dict[str, str] = {f"dsv4_{t}": args.prefer for t in attn_targets}
+    if moe_target:
+        # experts use HF's standard intent names — "flash" is the binder
+        # fast path registered into ALL_EXPERTS_FUNCTIONS. The DEFAULTS
+        # table maps {auto, flash, triton} -> "flash" (qwen3_5 + dsv4 share
+        # this entry; binder/shared/moe_experts.py handles dsv4 clamped
+        # SwiGLU via self.limit branch). Honour --prefer if it's "flash"
+        # or "auto"; otherwise fall back to flash since that's the only
+        # NPU-fast option binder ships for experts.
+        prefer_map["experts"] = "flash"
     chosen = binder.activate(fake, prefer=prefer_map)
     print(f"[binder]   activate() set: {chosen}")
 
@@ -363,8 +419,11 @@ def main() -> int:
         print(f"  {k:14s} {v:.6e}")
 
     print("\n=== Speed (avg over n-repeat) ===")
-    print(f"  baseline (all-torch DSV4):  {t_avg_off*1000:.2f} ms")
-    print(f"  binder ({args.prefer} on {sorted(targets)}):  {t_avg_on*1000:.2f} ms")
+    print(f"  baseline (attn torch, experts eager):    {t_avg_off*1000:.2f} ms")
+    binder_label = (
+        f"attn={sorted(attn_targets)} experts={'flash' if moe_target else 'eager'}"
+    )
+    print(f"  binder ({args.prefer} on {binder_label}):  {t_avg_on*1000:.2f} ms")
     if t_avg_on > 0:
         speedup = t_avg_off / t_avg_on
         print(f"  speedup:                    {speedup:.2f}x")
