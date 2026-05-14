@@ -140,7 +140,7 @@ def main() -> int:
     args = parser.parse_args()
 
     # Reuse the same test config for both sides
-    from alloy.tests.compare_dsv4_random import _build_configs
+    from alloy.tests.models.deepseek_v4.test_alloy_eq_hf import _build_configs
     hf_cfg, alloy_cfg = _build_configs()
     num_layers = hf_cfg.num_hidden_layers
 
