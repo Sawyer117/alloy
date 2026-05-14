@@ -21,16 +21,12 @@ Pure CPU torch.
 """
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
 try:
-    import hf_npu_binder  # noqa: F401  -- bridge dep; bail out below if absent
+    import hf_npu_binder  # noqa: F401  -- bridge dep; skip if absent
 except ImportError:
-    print("SKIP — hf_npu_binder not installed; bridge integration not exercised.")
-    sys.exit(0)
+    import pytest
+
+    pytest.skip("hf_npu_binder not installed", allow_module_level=True)
 
 # Importing the bridge has the side effect of registering binder backends.
 import alloy.integrations.hf_npu_binder as bridge

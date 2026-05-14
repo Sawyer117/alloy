@@ -130,17 +130,21 @@ def _run_json_roundtrip(config: AlloyConfig, tag: str) -> None:
     print(f"[{tag}] JSON roundtrip OK ({blank_line_count} group separators)")
 
 
+def test_qwen3_like_construct_and_roundtrip() -> None:
+    cfg = _qwen3_like_config()
+    _run_forward(cfg, "qwen3-like")
+    _run_json_roundtrip(cfg, "qwen3-like")
+
+
+def test_qwen3_5_moe_like_construct_and_roundtrip() -> None:
+    cfg = _qwen3_5_moe_like_config()
+    _run_forward(cfg, "qwen3.5-MoE-like")
+    _run_json_roundtrip(cfg, "qwen3.5-MoE-like")
+
+
 def main() -> int:
-    print("Constructing qwen3-like alloy model...")
-    q3_cfg = _qwen3_like_config()
-    _run_forward(q3_cfg, "qwen3-like")
-    _run_json_roundtrip(q3_cfg, "qwen3-like")
-
-    print("Constructing qwen3.5-MoE-like alloy model...")
-    q35_cfg = _qwen3_5_moe_like_config()
-    _run_forward(q35_cfg, "qwen3.5-MoE-like")
-    _run_json_roundtrip(q35_cfg, "qwen3.5-MoE-like")
-
+    test_qwen3_like_construct_and_roundtrip()
+    test_qwen3_5_moe_like_construct_and_roundtrip()
     print("\nAll smoke tests passed.")
     return 0
 
