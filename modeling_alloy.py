@@ -268,6 +268,22 @@ class _HyperConnection(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._impl_fn(self, hidden_streams)
 
+    def _alloy_init_weights(self, init_std: float) -> None:
+        """Init the three bare nn.Parameter attributes.
+
+        Without this, ``fn`` / ``base`` / ``scale`` stay at ``torch.empty()``
+        garbage memory (we've seen ``base ~ 1e+20`` and ``scale ~ 1e+34``
+        for un-init MHC), which silently dominates ``mix * scale + base``
+        in the sigmoid/softmax inputs and saturates every gate — producing
+        degenerate constant pre/post/comb across the batch. Mirrors HF
+        ``DeepseekV4PreTrainedModel._init_weights`` for the equivalent
+        class (``modeling_deepseek_v4.py:1214-1219``): normal_ for the
+        projection, zeros_ for the bias, ones_ for the per-class scale.
+        """
+        nn.init.normal_(self.fn, mean=0.0, std=init_std)
+        nn.init.zeros_(self.base)
+        nn.init.ones_(self.scale)
+
 
 def _torch_hyper_connection(
     module: nn.Module,
@@ -348,6 +364,17 @@ class _HyperHead(nn.Module):
         mixes = torch.nn.functional.linear(flat, self.hc_fn.float())
         pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
         return (pre.unsqueeze(-1) * x).sum(dim=2).to(x.dtype)
+
+    def _alloy_init_weights(self, init_std: float) -> None:
+        """Init bare nn.Parameter attributes. Same rationale as
+        :meth:`_HyperConnection._alloy_init_weights` — without this the
+        three params stay at ``torch.empty()`` garbage and saturate the
+        sigmoid input. Mirrors HF
+        ``DeepseekV4PreTrainedModel._init_weights`` for ``DeepseekV4HyperHead``
+        (``modeling_deepseek_v4.py:1220-1223``)."""
+        nn.init.normal_(self.hc_fn, mean=0.0, std=init_std)
+        nn.init.zeros_(self.hc_base)
+        nn.init.ones_(self.hc_scale)
 
 
 class AlloyMhcDecoderLayer(nn.Module):
