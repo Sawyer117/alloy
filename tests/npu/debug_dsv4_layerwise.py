@@ -130,13 +130,19 @@ def _build_config(args):
 # Hook helpers
 # ---------------------------------------------------------------------------
 def _hook_layers(model) -> dict[str, list[torch.Tensor]]:
-    """Register forward hooks on every decoder layer + final norm."""
+    """Register forward hooks on every decoder layer + final norm.
+
+    Hooks keep the captured tensor on the original device (no .to("cpu")
+    inside the hook) to avoid forcing a sync mid-forward that can collide
+    with the triton kernel's stream. CPU+fp32 conversion happens AFTER
+    the forward completes, in _diff_captures.
+    """
     captures: dict[str, list[torch.Tensor]] = {}
 
     def make_hook(name: str):
         def hook(_module, _inputs, output):
             t = output[0] if isinstance(output, tuple) else output
-            captures.setdefault(name, []).append(t.detach().to("cpu").to(torch.float32))
+            captures.setdefault(name, []).append(t.detach())
         return hook
 
     decoder = model.model.layers
@@ -166,6 +172,8 @@ def _diff_captures(
         if ta.shape != tb.shape:
             print(f"{k:22s} {'shape mismatch':28s} {tuple(ta.shape)} vs {tuple(tb.shape)}")
             continue
+        ta = ta.to("cpu").to(torch.float32)
+        tb = tb.to("cpu").to(torch.float32)
         d = (ta - tb).abs()
         ref = ta.abs()
         max_ref = ref.max().item()
@@ -268,8 +276,12 @@ def main() -> int:
         fn = getattr(model_a.model.layers[i].self_attn, '_attn_fn', None)
         print(f"    layer_{i} ({lt}) _attn_fn = {fn}")
 
+    print("[A] running forward...", flush=True)
     with torch.no_grad():
         _ = model_a(input_ids=input_ids, use_cache=False)
+    if hasattr(torch, "npu"):
+        torch.npu.synchronize()
+    print(f"[A] forward done. captures: {sorted(cap_a.keys())}", flush=True)
 
     # -------------------------------------------------------------------------
     # Build B: targeted layer types -> binder triton; others -> torch.
@@ -294,9 +306,21 @@ def main() -> int:
         fn = getattr(model_b.model.layers[i].self_attn, '_attn_fn', None)
         print(f"    layer_{i} ({lt}) _attn_fn = {fn}")
 
-    with torch.no_grad():
-        _ = model_b(input_ids=input_ids, use_cache=False)
+    print("[B] running forward...", flush=True)
+    try:
+        with torch.no_grad():
+            _ = model_b(input_ids=input_ids, use_cache=False)
+        if hasattr(torch, "npu"):
+            torch.npu.synchronize()
+        print(f"[B] forward done. captures: {sorted(cap_b.keys())}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        import traceback
+        print(f"\n[B] FORWARD RAISED: {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        # Still try to diff what we have (model_a captures are complete)
+        print(f"[B] captures collected before failure: {sorted(cap_b.keys())}", flush=True)
 
+    print("computing per-layer diffs...", flush=True)
     _diff_captures(cap_a, cap_b, cfg.layer_types, targets)
     return 0
 
