@@ -28,6 +28,7 @@ from hf_npu_binder.qwen3_5_moe import (
 )
 from hf_npu_binder.deepseek_v4 import (
     compressed_attention as _hf_compressed,
+    hyper_connection as _hf_hyper_connection,
     sparse_flash_attention as _hf_sfa,
 )
 
@@ -93,10 +94,15 @@ _HF_EXPERTS_BINDINGS: tuple[tuple[str, object], ...] = (
 # for DSV4 attention), so a single ``activate(model, "flash")`` call
 # still gets the fast path on every layer type.
 _DEEPSEEK_V4_BINDINGS: tuple[tuple[str, str, object], ...] = (
-    ("dsv4_csa.attention",     "triton",  _hf_sfa.triton),
-    ("dsv4_csa.attention",     "ascendc", _hf_sfa.ascendc),
-    ("dsv4_hca.attention",     "triton",  _hf_compressed.triton),
-    ("dsv4_sliding.attention", "triton",  _hf_compressed.triton),
+    ("dsv4_csa.attention",          "triton",  _hf_sfa.triton),
+    ("dsv4_csa.attention",          "ascendc", _hf_sfa.ascendc),
+    ("dsv4_hca.attention",          "triton",  _hf_compressed.triton),
+    ("dsv4_sliding.attention",      "triton",  _hf_compressed.triton),
+    # MHC HyperConnection: triton fast-path requires hc_mult=4 (DSV4
+    # paper config). Caller-side guard in the binder entry raises clear
+    # ValueError on other hc_mult, so registering globally is safe —
+    # users with non-paper configs hit a useful error at first forward.
+    ("dsv4_mhc.hyper_connection",   "triton",  _hf_hyper_connection.triton),
 )
 
 # Config field names that ``activate(prefer="<backend>")`` will broadcast a
@@ -137,6 +143,9 @@ def _register_all() -> None:
     _ACTIVATABLE_FIELDS.append(
         ("_dsv4_sliding_implementation", "deepseek_v4.compressed_attention")
     )
+    _ACTIVATABLE_FIELDS.append(
+        ("_dsv4_mhc_implementation",     "deepseek_v4.hyper_connection")
+    )
 
     # Per-bare-module-key default impl, consulted by alloy modules when
     # the user has not set ``config._<module>_implementation`` explicitly.
@@ -155,6 +164,9 @@ def _register_all() -> None:
     )
     DEFAULT_IMPL["dsv4_sliding"] = _resolve_intent(
         binder_defaults, "deepseek_v4.compressed_attention", "auto",
+    )
+    DEFAULT_IMPL["dsv4_mhc"] = _resolve_intent(
+        binder_defaults, "deepseek_v4.hyper_connection", "auto",
     )
 
 

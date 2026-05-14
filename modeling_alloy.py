@@ -247,31 +247,66 @@ class _HyperConnection(nn.Module):
         # Per-output-class scale: index 0 = pre, 1 = post, 2 = comb.
         self.scale = nn.Parameter(torch.empty(3))
 
+        # MHC HyperConnection dispatches through alloy's IMPL_REGISTRY
+        # so binder (or other backends) can provide a fast-path triton
+        # impl without modifying this class. Same pattern as DSV4
+        # attention surfaces. The torch default registered at module
+        # import time below; binder triton needs hc_mult=4 (DSV4 paper
+        # config) — caller is responsible for ensuring the registered
+        # impl is compatible with the model's hc_mult.
+        from .modules.registry import get_implementation, DEFAULT_IMPL
+        impl_name = getattr(
+            config, "_dsv4_mhc_implementation",
+            DEFAULT_IMPL.get("dsv4_mhc", "torch"),
+        )
+        self._impl_fn = get_implementation(
+            "dsv4_mhc.hyper_connection", impl_name, fallback="torch",
+        )
+
     def forward(
         self, hidden_streams: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
-        mix = torch.nn.functional.linear(flat, self.fn.float())
-        pre_scale, post_scale, comb_scale = self.scale.unbind(0)
-        hc = self.hc_mult
-        pre = torch.sigmoid(mix[..., :hc] * pre_scale + self.base[:hc]) + self.hc_eps
-        post = torch.sigmoid(mix[..., hc: 2 * hc] * post_scale + self.base[hc: 2 * hc]) + self.hc_eps
-        comb = (
-            torch.sigmoid(
-                mix[..., 2 * hc:].view(*mix.shape[:-1], hc, hc) * comb_scale
-                + self.base[2 * hc:].view(hc, hc)
-            )
-            + self.hc_eps
+        return self._impl_fn(self, hidden_streams)
+
+
+def _torch_hyper_connection(
+    module: nn.Module,
+    hidden_streams: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """torch reference impl of MHC HyperConnection forward.
+
+    Body is the original ``_HyperConnection.forward`` math, refactored
+    into a standalone function so it can be registered into alloy's
+    IMPL_REGISTRY (same pattern as ``_torch_dsv4_attention``). Reads
+    parameters / scalars off the ``module`` argument so binder /
+    accelerator backends can share the same signature.
+    """
+    flat = module.input_norm(hidden_streams.flatten(start_dim=2).float())
+    mix = torch.nn.functional.linear(flat, module.fn.float())
+    pre_scale, post_scale, comb_scale = module.scale.unbind(0)
+    hc = module.hc_mult
+    pre = torch.sigmoid(mix[..., :hc] * pre_scale + module.base[:hc]) + module.hc_eps
+    post = torch.sigmoid(mix[..., hc:2 * hc] * post_scale + module.base[hc:2 * hc]) + module.hc_eps
+    comb = (
+        torch.sigmoid(
+            mix[..., 2 * hc:].view(*mix.shape[:-1], hc, hc) * comb_scale
+            + module.base[2 * hc:].view(hc, hc)
         )
-        # Sinkhorn-Knopp projection onto the doubly-stochastic manifold:
-        # alternate row + column normalisation for ``hc_sinkhorn_iters`` steps.
-        for _ in range(self.hc_sinkhorn_iters):
-            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.hc_eps)
-            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.hc_eps)
-        # Collapse hc_mult parallel streams into a single sequence ready
-        # for the sublayer (attn / mlp).
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-        return post, comb, collapsed
+        + module.hc_eps
+    )
+    for _ in range(module.hc_sinkhorn_iters):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + module.hc_eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + module.hc_eps)
+    collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+    return post, comb, collapsed
+
+
+# Register torch impl at module import. Imported here (after the
+# function def) instead of at top-of-file to keep the registry import
+# adjacent to its consumer for readability. Bridge / other backends
+# register additional impls under the same key.
+from .modules.registry import register_implementation as _register_implementation
+_register_implementation("dsv4_mhc.hyper_connection", "torch", _torch_hyper_connection)
 
 
 class _HyperHead(nn.Module):

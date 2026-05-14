@@ -149,8 +149,11 @@ def _build_config(args) -> AlloyConfig:
         rms_norm_eps=1e-6,
         attention_bias=False,
         attention_dropout=0.0,
-        # MHC (mixture of head clusters)
-        hc_mult=2,
+        # MHC (mixture of head clusters). DSV4 paper / production uses
+        # hc_mult=4 — the binder MHC triton kernels are hardcoded for
+        # that (manually-unrolled 4-stream loops). hc_mult is overridable
+        # via --hc-mult; --target mhc enforces 4.
+        hc_mult=args.hc_mult,
         hc_sinkhorn_iters=2,
         hc_eps=1e-6,
         use_mhc=True,
@@ -234,6 +237,12 @@ def main() -> int:
     parser.add_argument("--num-experts", type=int, default=4)
     parser.add_argument("--num-experts-per-tok", type=int, default=2)
     parser.add_argument("--vocab-size", type=int, default=1024)
+    parser.add_argument(
+        "--hc-mult", type=int, default=2,
+        help="MHC stream multiplicity. Default 2 keeps prior tests cheap; "
+             "--target mhc requires 4 (DSV4 paper config matching the "
+             "vendored MindSpeed triton kernels which manually unroll 4 streams).",
+    )
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
@@ -289,15 +298,20 @@ def main() -> int:
     #                   (HF ALL_EXPERTS_FUNCTIONS). Routed via separate field
     #                   because experts dispatch is HF-canonical, not
     #                   per-layer-type.
+    #   mhc_target    — bool; controls _dsv4_mhc_implementation flip
+    #                   (every MHC HyperConnection site in the model).
+    #                   Requires config.hc_mult == 4 — binder triton path
+    #                   raises otherwise.
     _ALL_ATTN_TARGETS = {"csa", "hca", "sliding"}
-    _ALL_VALID = _ALL_ATTN_TARGETS | {"experts"}
+    _ALL_VALID = _ALL_ATTN_TARGETS | {"experts", "mhc"}
     raw = [t.strip() for t in args.target.split(",") if t.strip()]
     if "all" in raw:
-        # 'all' means all attention layer types; experts must be opted in
-        # explicitly so accidentally hitting it doesn't change the baseline
-        # cost reference.
+        # 'all' means all attention layer types; experts + mhc must be
+        # opted in explicitly so accidentally hitting them doesn't change
+        # the baseline cost reference.
         attn_targets = set(_ALL_ATTN_TARGETS)
         moe_target = False
+        mhc_target = False
     else:
         unknown = set(raw) - _ALL_VALID
         if unknown:
@@ -306,7 +320,16 @@ def main() -> int:
             return 2
         attn_targets = set(raw) & _ALL_ATTN_TARGETS
         moe_target = "experts" in raw
-    print(f"binder targets for this run: attn={sorted(attn_targets)}  experts={moe_target}")
+        mhc_target = "mhc" in raw
+
+    if mhc_target and cfg.hc_mult != 4:
+        print(f"ERROR - --target mhc requires config.hc_mult == 4 (DSV4 paper "
+              f"config). Vendored MindSpeed triton kernels hardcode 4 streams; "
+              f"got hc_mult={cfg.hc_mult}. Bump --hc-mult or drop mhc from target.")
+        return 2
+
+    print(f"binder targets for this run: attn={sorted(attn_targets)}  "
+          f"experts={moe_target}  mhc={mhc_target}")
 
     # Layer-type populations (per chosen layer_types pattern).
     _LAYER_TYPE_BY_TARGET = {
@@ -318,15 +341,16 @@ def main() -> int:
               for t in _ALL_ATTN_TARGETS}
     moe_layer_count = sum(1 for lt in cfg.ffn_types if "moe" in lt)
     attn_targeted_count = sum(counts[t] for t in attn_targets)
-    if attn_targeted_count == 0 and not moe_target:
+    if attn_targeted_count == 0 and not moe_target and not mhc_target:
         print(f"SKIP - no targeted surfaces present "
               f"(layer_types={cfg.layer_types}, ffn_types={cfg.ffn_types}, "
-              f"attn={sorted(attn_targets)}, experts={moe_target}); "
+              f"attn={sorted(attn_targets)}, experts={moe_target}, mhc={mhc_target}); "
               f"nothing for binder to fast-path.")
         return 0
     print(f"layer counts: attn={counts}  moe_layers={moe_layer_count}  →  "
           f"attn {attn_targeted_count}/{args.num_layers} swapped, "
-          f"experts {'flash on all' if moe_target else 'eager (untouched)'}")
+          f"experts {'flash on all' if moe_target else 'eager (untouched)'}, "
+          f"mhc {'triton on all' if mhc_target else 'torch (untouched)'}")
 
     torch.manual_seed(args.seed)
     # Generate on CPU then move — some CANN releases route a direct
@@ -349,8 +373,10 @@ def main() -> int:
     # "eager" runs HF's original _Experts.forward loop body (one expert at a
     # time over selected tokens) — the meaningful torch baseline.
     cfg._experts_implementation = "eager"
+    cfg._dsv4_mhc_implementation = "torch"
     print("\n" + "=" * 70)
-    print("[baseline] alloy default (attn -> _torch_dsv4_attention, experts -> HF eager)")
+    print("[baseline] alloy default (attn -> _torch_dsv4_attention, "
+          "experts -> HF eager, mhc -> _torch_hyper_connection)")
     torch.manual_seed(args.seed)
     baseline_model = AlloyForCausalLM(cfg).to(device=device, dtype=dtype)
     baseline_logits, t_first_off, t_avg_off = _measure(
@@ -369,7 +395,8 @@ def main() -> int:
     # Phase 2: BINDER — flip targeted surfaces to args.prefer; rest stay torch
     # =========================================================================
     print("\n" + "=" * 70)
-    print(f"[binder]   activating prefer={args.prefer!r} on attn={sorted(attn_targets)}  experts={moe_target}")
+    print(f"[binder]   activating prefer={args.prefer!r} on "
+          f"attn={sorted(attn_targets)}  experts={moe_target}  mhc={mhc_target}")
     # deepcopy so _attn_implementation (and any other underscore-prefixed
     # runtime hint) survives — AlloyConfig.to_dict() drops underscore fields
     # by design (so they don't leak into config.json), but for within-process
@@ -388,6 +415,10 @@ def main() -> int:
         # or "auto"; otherwise fall back to flash since that's the only
         # NPU-fast option binder ships for experts.
         prefer_map["experts"] = "flash"
+    if mhc_target:
+        # MHC HyperConnection: triton is the only non-torch backend.
+        # Caller is responsible for hc_mult=4 (verified above).
+        prefer_map["dsv4_mhc"] = "triton"
     chosen = binder.activate(fake, prefer=prefer_map)
     print(f"[binder]   activate() set: {chosen}")
 
@@ -419,9 +450,11 @@ def main() -> int:
         print(f"  {k:14s} {v:.6e}")
 
     print("\n=== Speed (avg over n-repeat) ===")
-    print(f"  baseline (attn torch, experts eager):    {t_avg_off*1000:.2f} ms")
+    print(f"  baseline (attn torch, experts eager, mhc torch):    {t_avg_off*1000:.2f} ms")
     binder_label = (
-        f"attn={sorted(attn_targets)} experts={'flash' if moe_target else 'eager'}"
+        f"attn={sorted(attn_targets)} "
+        f"experts={'flash' if moe_target else 'eager'} "
+        f"mhc={'triton' if mhc_target else 'torch'}"
     )
     print(f"  binder ({args.prefer} on {binder_label}):  {t_avg_on*1000:.2f} ms")
     if t_avg_on > 0:

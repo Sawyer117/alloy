@@ -153,8 +153,40 @@ def test_dsv4_sliding_triton_registered() -> None:
     )
 
 
+def test_dsv4_mhc_torch_registered() -> None:
+    """alloy's ``_torch_hyper_connection`` is registered under
+    ``dsv4_mhc.hyper_connection:torch`` at module-import time. The bridge
+    doesn't override it — it leaves the torch impl alone and adds binder
+    entries alongside."""
+    impls = list_implementations("dsv4_mhc")
+    key = "dsv4_mhc.hyper_connection"
+    assert key in impls, f"missing {key!r} from IMPL_REGISTRY; got: {list(impls)}"
+    assert "torch" in impls[key], (
+        f"expected 'torch' impl on {key}; got: {sorted(impls[key])}"
+    )
+    fn = get_implementation(key, "torch")
+    from alloy.modeling_alloy import _torch_hyper_connection
+    assert fn is _torch_hyper_connection, (
+        f"{key}:torch should be alloy's _torch_hyper_connection, got {fn!r}"
+    )
+
+
+def test_dsv4_mhc_triton_registered() -> None:
+    """The binder's ``hyper_connection.triton`` adapter (composes
+    rmsnorm_without_weight + sinkhorn + pre_bmm vendored kernels) is
+    registered under ``dsv4_mhc.hyper_connection:triton``. The entry's
+    hc_mult=4 guard is checked at first forward, not registration."""
+    from hf_npu_binder.deepseek_v4 import hyper_connection as _hf_hc
+
+    fn = get_implementation("dsv4_mhc.hyper_connection", "triton")
+    assert fn is _hf_hc.triton, (
+        f"dsv4_mhc.hyper_connection:triton should be hf_npu_binder's "
+        f"hyper_connection.triton, got {fn!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
-# activate() broadcasts to all three DSV4 fields
+# activate() broadcasts to all four DSV4 fields (3 attn + 1 mhc)
 # ---------------------------------------------------------------------------
 def test_activate_writes_all_dsv4_fields() -> None:
     """``activate(model, prefer=...)`` covers all three DSV4 dispatch
@@ -173,21 +205,25 @@ def test_activate_writes_all_dsv4_fields() -> None:
     # Each intent -> expected impl name per layer type
     expected_per_intent: dict[str, dict[str, str]] = {
         "auto": {
-            # auto -> torch on both attention surfaces (intentional;
-            # triton isn't a measured speed win and adds bf16 drift)
+            # auto -> torch on all DSV4 surfaces (intentional; triton
+            # isn't a measured speed win at toy config and adds bf16
+            # drift; ascendc is opt-in only)
             "_dsv4_csa_implementation":     "torch",
             "_dsv4_hca_implementation":     "torch",
             "_dsv4_sliding_implementation": "torch",
+            "_dsv4_mhc_implementation":     "torch",
         },
         "flash": {
             "_dsv4_csa_implementation":     "triton",   # no flash; triton is closest
             "_dsv4_hca_implementation":     "triton",
             "_dsv4_sliding_implementation": "triton",
+            "_dsv4_mhc_implementation":     "triton",
         },
         "triton": {
             "_dsv4_csa_implementation":     "triton",
             "_dsv4_hca_implementation":     "triton",
             "_dsv4_sliding_implementation": "triton",
+            "_dsv4_mhc_implementation":     "triton",
         },
         "ascendc": {
             "_dsv4_csa_implementation":     "ascendc",
@@ -198,11 +234,15 @@ def test_activate_writes_all_dsv4_fields() -> None:
             # that resolves to nothing.
             "_dsv4_hca_implementation":     "torch",
             "_dsv4_sliding_implementation": "torch",
+            # MHC has no ascendc port (would need aclnn op for the full
+            # sinkhorn + bmm chain). Falls back to torch.
+            "_dsv4_mhc_implementation":     "torch",
         },
         "torch": {
             "_dsv4_csa_implementation":     "torch",
             "_dsv4_hca_implementation":     "torch",
             "_dsv4_sliding_implementation": "torch",
+            "_dsv4_mhc_implementation":     "torch",
         },
     }
     for intent, want_fields in expected_per_intent.items():
@@ -226,6 +266,8 @@ _TESTS = [
     test_dsv4_csa_ascendc_registered,
     test_dsv4_hca_triton_registered,
     test_dsv4_sliding_triton_registered,
+    test_dsv4_mhc_torch_registered,
+    test_dsv4_mhc_triton_registered,
     test_activate_writes_all_dsv4_fields,
 ]
 
