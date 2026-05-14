@@ -275,26 +275,42 @@ def _torch_hyper_connection(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """torch reference impl of MHC HyperConnection forward.
 
-    Body is the original ``_HyperConnection.forward`` math, refactored
-    into a standalone function so it can be registered into alloy's
-    IMPL_REGISTRY (same pattern as ``_torch_dsv4_attention``). Reads
-    parameters / scalars off the ``module`` argument so binder /
+    Math mirrors HF transformers DSV4 ``DeepseekV4HyperConnection.forward``
+    exactly (modular_deepseek_v4.py:815-833 as of 2026-05-15):
+
+      - pre  = sigmoid(pre_w * pre_scale + pre_b) + hc_eps
+      - post = 2 * sigmoid(post_w * post_scale + post_b)         ← note: 2*, no eps
+      - comb = softmax(comb_logits, dim=-1) + hc_eps             ← softmax, not sigmoid
+      - sinkhorn: starts with one column normalisation, then
+        (hc_sinkhorn_iters - 1) row/col iterations
+
+    Important — earlier alloy versions had post = sigmoid + eps,
+    comb = sigmoid + eps, and a plain ``iters`` row/col loop. Those
+    diverged from HF main and produced ~70% relative drift vs binder
+    triton (which was correct per the MindSpeed kernel that matches HF).
+    This version is HF-correct; any check / load against pre-fix
+    alloy outputs will of course also drift — but the prior numbers
+    were never paper-faithful to begin with.
+
+    Reads parameters / scalars off the ``module`` argument so binder /
     accelerator backends can share the same signature.
     """
+    hc = module.hc_mult
     flat = module.input_norm(hidden_streams.flatten(start_dim=2).float())
     mix = torch.nn.functional.linear(flat, module.fn.float())
+    pre_w, post_w, comb_w = mix.split([hc, hc, hc * hc], dim=-1)
+    pre_b, post_b, comb_b = module.base.split([hc, hc, hc * hc])
     pre_scale, post_scale, comb_scale = module.scale.unbind(0)
-    hc = module.hc_mult
-    pre = torch.sigmoid(mix[..., :hc] * pre_scale + module.base[:hc]) + module.hc_eps
-    post = torch.sigmoid(mix[..., hc:2 * hc] * post_scale + module.base[hc:2 * hc]) + module.hc_eps
-    comb = (
-        torch.sigmoid(
-            mix[..., 2 * hc:].view(*mix.shape[:-1], hc, hc) * comb_scale
-            + module.base[2 * hc:].view(hc, hc)
-        )
-        + module.hc_eps
-    )
-    for _ in range(module.hc_sinkhorn_iters):
+
+    pre = torch.sigmoid(pre_w * pre_scale + pre_b) + module.hc_eps
+    post = 2 * torch.sigmoid(post_w * post_scale + post_b)
+    comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
+    comb = torch.softmax(comb_logits, dim=-1) + module.hc_eps
+    # Sinkhorn-Knopp: starting column normalisation (handles the initial
+    # softmax already-row-stochastic state), then `iters - 1` row/col
+    # iterations to converge toward doubly-stochastic.
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + module.hc_eps)
+    for _ in range(module.hc_sinkhorn_iters - 1):
         comb = comb / (comb.sum(dim=-1, keepdim=True) + module.hc_eps)
         comb = comb / (comb.sum(dim=-2, keepdim=True) + module.hc_eps)
     collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
