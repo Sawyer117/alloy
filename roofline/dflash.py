@@ -39,11 +39,41 @@ from .analyze import (
 )
 from .hardware import Hardware, get_hardware
 from .specs import LinearSpec, RMSNormSpec, dtype_size
-from .specs_dflash import DFlashAttentionSpec
+from .specs_dflash import DFlashAttentionSpec, DSV4DFlashAttentionSpec
 from .specs_ffn import SwiGLUMLPSpec
 
 
-_DRAFT_ATTN_SPEC = DFlashAttentionSpec()
+# Cache one spec per layer_type so we don't reconstruct every call.
+_DFLASH_ATTN_PLAIN = DFlashAttentionSpec()
+_DFLASH_ATTN_DSV4 = {
+    lt: DSV4DFlashAttentionSpec(lt)
+    for lt in ("dsv4_sliding_attention", "dsv4_hca_attention", "dsv4_csa_attention")
+}
+
+
+def _draft_attn_spec_for(layer_type: str):
+    """Pick the attention spec matching the draft config's layer_types[i].
+
+    - ``qwen3_attention`` / ``dflash_attention`` → plain non-causal DFlash spec
+      (Qwen3-dense draft = canonical convention).
+    - ``dsv4_{sliding,hca,csa}_attention`` → DSV4-style DFlash spec that
+      captures effective-KV truncation + Q-LoRA / grouped O-LoRA / indexer.
+
+    The DSV4 case was previously hard-coded to the plain spec, which silently
+    discarded HCA/CSA's KV truncation savings — making hybrid drafts look
+    strictly worse than canonical despite their architectural advantage at
+    long context. See ``project_dflash_draft_modeling_gap`` memo.
+    """
+    if layer_type in ("qwen3_attention", "dflash_attention"):
+        return _DFLASH_ATTN_PLAIN
+    if layer_type in _DFLASH_ATTN_DSV4:
+        return _DFLASH_ATTN_DSV4[layer_type]
+    raise ValueError(
+        f"Unsupported draft layer_type for DFlash draft modeling: {layer_type!r}. "
+        f"Supported: qwen3_attention | dflash_attention | dsv4_{{sliding,hca,csa}}_attention."
+    )
+
+
 _DRAFT_MLP_SPEC = SwiGLUMLPSpec()
 _NORM_SPEC = RMSNormSpec()
 
@@ -123,6 +153,18 @@ def roofline_dflash_draft_forward(
     ))
 
     # ---- N x (input_norm + attn + post_attn_norm + mlp) ----
+    # Per-layer attention spec dispatch: respect cfg.layer_types[i] so
+    # DSV4-style hybrid drafts get HCA/CSA effective-KV truncation modeled
+    # instead of being silently treated as plain Qwen3 attention.
+    layer_types = list(getattr(config, "layer_types", []) or [])
+    if not layer_types:
+        layer_types = ["dflash_attention"] * n_layers
+    if len(layer_types) != n_layers:
+        raise ValueError(
+            f"config.layer_types length ({len(layer_types)}) does not match "
+            f"num_hidden_layers ({n_layers})."
+        )
+
     layer_q_shape = (batch, q_len, hidden)
     attn_kwargs = {"kv_cache_len": past_cache_len, "ctx_len": ctx_len}
     for i in range(n_layers):
@@ -131,10 +173,12 @@ def roofline_dflash_draft_forward(
             flops=_NORM_SPEC.flops(layer_q_shape),
             bytes=_NORM_SPEC.bytes(layer_q_shape, dtype=dtype),
         ))
+        layer_type = layer_types[i]
+        spec = _draft_attn_spec_for(layer_type)
         report.modules.append(ModuleStat(
-            kind="mixer", name="dflash_attention", layer_idx=i,
-            flops=_DRAFT_ATTN_SPEC.flops(layer_q_shape, config, **attn_kwargs),
-            bytes=_DRAFT_ATTN_SPEC.bytes(layer_q_shape, config, dtype, **attn_kwargs),
+            kind="mixer", name=layer_type, layer_idx=i,
+            flops=spec.flops(layer_q_shape, config, **attn_kwargs),
+            bytes=spec.bytes(layer_q_shape, config, dtype, **attn_kwargs),
         ))
         report.modules.append(ModuleStat(
             kind="norm", name="post_attention_layernorm", layer_idx=i,
