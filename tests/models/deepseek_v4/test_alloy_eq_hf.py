@@ -87,6 +87,22 @@ def _build_configs(attn_implementation: str = "eager"):
             "compressed_sparse_attention": 4,
             "heavily_compressed_attention": 8,
         },
+        # HF DeepseekV4Config computes ``qk_rope_head_dim = int(head_dim *
+        # partial_rotary_factor)`` from the **top-level** field at
+        # ``__post_init__`` time. That value drives attention's nope/rope
+        # channel split (proj_q output is sliced [nope | rope] with
+        # rope = qk_rope_head_dim channels). Meanwhile DeepseekV4RotaryEmbedding
+        # reads the per-rope-type ``partial_rotary_factor`` from inside
+        # ``rope_parameters[layer_type]`` to size cos/sin. If those two
+        # disagree, attention applies rope to a different channel count than
+        # the cos/sin tensor has — drift on every forward (~16% max_abs on
+        # this toy config).
+        #
+        # Fix: pass the same value at the top level AND in both nested
+        # sub-dicts so HF's two read sites stay in sync. AlloyConfig
+        # ignores the top-level kwarg (alloy reads only nested) so passing
+        # it doesn't disturb the alloy path.
+        partial_rotary_factor=0.25,
         rope_parameters={
             "main":     {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.25},
             "compress": {"rope_type": "default", "rope_theta": 100000.0, "partial_rotary_factor": 0.25},
