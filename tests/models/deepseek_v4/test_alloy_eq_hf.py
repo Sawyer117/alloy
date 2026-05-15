@@ -122,6 +122,20 @@ def _build_configs(attn_implementation: str = "eager"):
         attn_implementation=attn_implementation,
         **common,
     )
+    # Pin alloy DSV4 attention + MHC to torch so the comparison is
+    # alloy_torch == HF_torch (contract 1). Bridge import elsewhere in
+    # the session sets DEFAULT_IMPL for these surfaces to whatever binder
+    # DEFAULTS["auto"] says; pinning here makes the test outcome
+    # independent of bridge state.
+    #
+    # Don't pin _experts_implementation — alloy reads it from the same
+    # config dict HF reads from, so whatever HF's implicit default is,
+    # alloy picks the same. Explicitly setting "eager" diverges if HF
+    # internally names its default something other than "eager".
+    alloy_cfg._dsv4_csa_implementation = "torch"
+    alloy_cfg._dsv4_hca_implementation = "torch"
+    alloy_cfg._dsv4_sliding_implementation = "torch"
+    alloy_cfg._dsv4_mhc_implementation = "torch"
     return hf_cfg, alloy_cfg
 
 

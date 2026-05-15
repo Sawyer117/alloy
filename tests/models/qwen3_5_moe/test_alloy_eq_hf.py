@@ -55,6 +55,17 @@ def _build_configs(attn_implementation: str = "eager"):
     )
     alloy_cfg = alloy_config_from_qwen3_5_text(hf_cfg)
     alloy_cfg._attn_implementation = attn_implementation
+    # Pin alloy GDN to torch so the comparison is alloy_torch == HF_torch
+    # (contract 1). Without this, a bridge import elsewhere in the session
+    # flips DEFAULT_IMPL["qwen3_5_gdn"] to "triton" and the binder triton
+    # kernel (which rejects fp32) hijacks the forward.
+    #
+    # Do NOT pin _experts_implementation here — HF and alloy both read the
+    # same field from the same config dict at experts forward time, so
+    # whatever HF's eager-or-default impl is, alloy picks the same.
+    # Explicitly setting "eager" on alloy_cfg only would diverge if HF's
+    # implicit default isn't named "eager".
+    alloy_cfg._qwen3_5_gdn_implementation = "torch"
     return hf_cfg, alloy_cfg
 
 

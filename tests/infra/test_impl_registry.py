@@ -124,11 +124,24 @@ def test_list_implementations_filters_by_prefix() -> None:
 
 
 def test_default_dispatch_uses_torch_impls() -> None:
-    cfg = _gdn_config()
-    layer = Qwen35GatedDeltaNet(cfg, layer_idx=0)
-    assert layer._chunk_rule_fn is _torch_chunk_gated_delta_rule
-    assert layer._recurrent_rule_fn is _torch_recurrent_gated_delta_rule
-    assert layer._causal_conv1d_fn is _torch_causal_conv1d_update
+    """Verifies the implicit fallback path: when neither the user nor any
+    bridge has set a preference, the module picks the torch impl. Tests
+    must be order-independent — if test_binder_bridge.py ran first in the
+    same pytest session, it imported the bridge, which sets
+    DEFAULT_IMPL["qwen3_5_gdn"] = "<binder's auto>". Save/restore that
+    entry so this test measures the bare fallback regardless of who ran
+    before."""
+    from alloy.modules.registry import DEFAULT_IMPL
+    saved = DEFAULT_IMPL.pop("qwen3_5_gdn", None)
+    try:
+        cfg = _gdn_config()
+        layer = Qwen35GatedDeltaNet(cfg, layer_idx=0)
+        assert layer._chunk_rule_fn is _torch_chunk_gated_delta_rule
+        assert layer._recurrent_rule_fn is _torch_recurrent_gated_delta_rule
+        assert layer._causal_conv1d_fn is _torch_causal_conv1d_update
+    finally:
+        if saved is not None:
+            DEFAULT_IMPL["qwen3_5_gdn"] = saved
 
 
 def test_override_dispatch_via_config_field() -> None:

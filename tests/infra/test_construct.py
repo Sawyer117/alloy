@@ -46,9 +46,16 @@ def _qwen3_like_config() -> AlloyConfig:
 
 
 def _qwen3_5_moe_like_config() -> AlloyConfig:
-    """4 layers: [gdn, gdn, gdn, attn] × qwen3_5_moe FFN, gated attn, (1+w)-init RMSNorm."""
+    """4 layers: [gdn, gdn, gdn, attn] × qwen3_5_moe FFN, gated attn, (1+w)-init RMSNorm.
+
+    Pins dispatch to torch / eager so the smoke test is bridge-import
+    agnostic — without this, importing alloy.integrations.hf_npu_binder
+    elsewhere in the session sets DEFAULT_IMPL["qwen3_5_gdn"]="triton",
+    which then hijacks this construct test's fp32 forward (triton kernel
+    rejects fp32, while this smoke test runs in fp32).
+    """
     num_layers = 4
-    return AlloyConfig(
+    cfg = AlloyConfig(
         vocab_size=1024,
         hidden_size=128,
         num_hidden_layers=num_layers,
@@ -78,6 +85,8 @@ def _qwen3_5_moe_like_config() -> AlloyConfig:
             "partial_rotary_factor": 0.25,
         },
     )
+    cfg._qwen3_5_gdn_implementation = "torch"
+    return cfg
 
 
 def _run_forward(config: AlloyConfig, tag: str) -> None:

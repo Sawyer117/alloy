@@ -47,40 +47,52 @@ def test_activate_broadcast() -> None:
     Today's DEFAULTS:
       - qwen3_5_moe.chunk_gated_delta_rule + experts both ship "flash",
         so an intent of ``"flash"`` lands literally.
-      - deepseek_v4.sparse_flash_attention has no dedicated flash
-        backend; its DEFAULTS routes ``"flash"`` to ``"triton"`` (the
-        BHSD adapter over the vendored MindSpeed kernel).
+      - deepseek_v4.{sparse_flash_attention, compressed_attention,
+        hyper_connection} have no dedicated flash backend; their
+        DEFAULTS route ``"flash"`` to ``"triton"`` (the vendored
+        MindSpeed kernels via BHSD adapter / MHC sinkhorn-pre_bmm).
     """
     model = _fake_model()
     chosen = bridge.activate(model, prefer="flash")
     expected = {
-        "_qwen3_5_gdn_implementation": "flash",
-        "_experts_implementation":     "flash",
-        "_dsv4_csa_implementation":    "triton",  # SFA: flash -> triton
+        "_qwen3_5_gdn_implementation":    "flash",
+        "_experts_implementation":        "flash",
+        "_dsv4_csa_implementation":       "triton",  # SFA: flash -> triton
+        "_dsv4_hca_implementation":       "triton",  # compressed_attn: flash -> triton
+        "_dsv4_sliding_implementation":   "triton",  # compressed_attn: flash -> triton
+        "_dsv4_mhc_implementation":       "triton",  # hyper_connection: flash -> triton
     }
     assert chosen == expected, chosen
     cfg = model.config
-    assert getattr(cfg, "_qwen3_5_gdn_implementation") == "flash"
-    assert getattr(cfg, "_experts_implementation") == "flash"
-    assert getattr(cfg, "_dsv4_csa_implementation") == "triton"
+    for field, impl in expected.items():
+        assert getattr(cfg, field) == impl, (field, getattr(cfg, field), impl)
 
 
 def test_activate_auto_per_operator_recommendation() -> None:
     """``activate(model, "auto")`` consults each operator's recommended
     impl from ``hf_npu_binder.DEFAULTS`` — never blindly broadcasts
     "auto" as a literal string (which would never resolve in
-    ``IMPL_REGISTRY``)."""
+    ``IMPL_REGISTRY``).
+
+    Auto recommendations per DEFAULTS (evidence-based, see binder
+    __init__ docstring): GDN auto=triton, experts auto=flash. DSV4
+    attention surfaces auto=torch — triton-ascend isn't a measured
+    speed win on toy configs and adds bf16 drift through stacked
+    layers, so 'auto' opts out by default; users get triton via
+    explicit ``activate(prefer='triton')`` or ``ascendc`` for the
+    genuine CSA fast path once CANN ships ``aclnnSparseAttnSharedkv``.
+    """
     model = _fake_model()
     chosen = bridge.activate(model, prefer="auto")
     # Each value must be an actual impl name registered in IMPL_REGISTRY,
     # not the literal "auto".
     assert "auto" not in chosen.values(), chosen
-    # GDN -> triton; experts -> flash; SFA -> triton (the BHSD adapter
-    # is the current default until a verified-fast CANN version with
-    # ``aclnnSparseAttnSharedkv`` is widely available).
     assert chosen["_qwen3_5_gdn_implementation"] == "triton"
     assert chosen["_experts_implementation"] == "flash"
-    assert chosen["_dsv4_csa_implementation"] == "triton"
+    assert chosen["_dsv4_csa_implementation"] == "torch"
+    assert chosen["_dsv4_hca_implementation"] == "torch"
+    assert chosen["_dsv4_sliding_implementation"] == "torch"
+    assert chosen["_dsv4_mhc_implementation"] == "torch"
 
 
 def test_activate_explicit_mapping_with_bare_module_key() -> None:

@@ -469,12 +469,20 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def test_dsv4_binder_auto_vs_torch_npu() -> None:
-    """Contract 2: alloy_torch ≈ binder(auto/triton) on NPU, bf16 noise floor."""
+    """Contract 2: alloy_torch ≈ binder(auto/triton) on NPU, bf16 noise floor.
+
+    Default target = csa,sliding (excludes HCA). HCA's triton SFA path
+    computes width as ``sliding_window + ceil(seq_len/compress_rate_hca)``;
+    with the default toy config (W=128, seq=128, compress_rate_hca=8) that
+    lands on 144, which isn't in the binder kernel's CONFIG_MAP {128, 160,
+    640} and raises ValueError. CLI users targeting HCA must adjust
+    --seq-len / --sliding-window so HCA's width lands supported (e.g.
+    seq=4096 + compress_rate_hca=128 → 128+32=160)."""
     if _IMPORT_ERR is not None:
         import pytest
 
         pytest.skip(_IMPORT_ERR)
-    assert main([]) == 0
+    assert main(["--target=csa,sliding"]) == 0
 
 
 if __name__ == "__main__":
