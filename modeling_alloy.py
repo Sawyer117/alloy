@@ -454,11 +454,16 @@ class AlloyMhcDecoderLayer(nn.Module):
         )
         if isinstance(mixer_out, tuple):
             mixer_out = mixer_out[0]
-        # Reblend single-stream sublayer output back into multi-stream:
-        #   post[..., None] * mixer_out[..., None, :] + comb @ hidden_streams
+        # Reblend single-stream sublayer output back into multi-stream.
+        # Indexing: ``hidden_streams[..., k, d] = post[..., k] * mixer_out[..., d]
+        # + sum_j comb[..., j, k] * old_streams[..., j, d]``. The sum is over
+        # the FIRST hc axis of comb (j), so the matmul needs comb transposed
+        # along its last two dims — equivalent to ``comb.T @ old_streams``.
+        # comb is Sinkhorn-projected (doubly-stochastic) but NOT symmetric,
+        # so direction matters. Mirrors HF main DSV4 DecoderLayer.forward.
         hidden_streams = (
             post.to(dtype).unsqueeze(-1) * mixer_out.unsqueeze(-2)
-            + torch.matmul(comb.to(dtype), hidden_streams)
+            + torch.matmul(comb.to(dtype).transpose(-1, -2), hidden_streams)
         )
 
         # MLP site (same shape of mix as attention).
@@ -468,7 +473,7 @@ class AlloyMhcDecoderLayer(nn.Module):
             mlp_out = mlp_out[0]
         hidden_streams = (
             post.to(dtype).unsqueeze(-1) * mlp_out.unsqueeze(-2)
-            + torch.matmul(comb.to(dtype), hidden_streams)
+            + torch.matmul(comb.to(dtype).transpose(-1, -2), hidden_streams)
         )
         return hidden_streams
 
