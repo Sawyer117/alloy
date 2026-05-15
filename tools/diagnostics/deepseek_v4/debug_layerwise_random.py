@@ -67,7 +67,7 @@ def _attach_hooks_full(model, num_layers: int):
     return store, handles
 
 
-def _attach_hooks_layer0_sub(model, side_label: str):
+def _attach_hooks_layer_sub(model, side_label: str, layer_idx: int = 0):
     """Hook every interesting sub-point inside layer 0 for fine-grained
     drill-down. Sub-modules are named the same on both sides.
 
@@ -84,30 +84,31 @@ def _attach_hooks_layer0_sub(model, side_label: str):
     """
     store: dict[str, torch.Tensor] = {}
     handles: list = []
-    layer0 = model.model.layers[0]
+    layer = model.model.layers[layer_idx]
+    tag = f"L{layer_idx:02d}"
 
     # ----- block-level -----
     coarse = ["input_layernorm", "self_attn", "post_attention_layernorm",
               "mlp", "attn_hc", "ffn_hc"]
     for name in coarse:
-        if hasattr(layer0, name):
-            handles.append(getattr(layer0, name).register_forward_hook(
-                _capture_hook(store, f"L0/{side_label}/{name}")
+        if hasattr(layer, name):
+            handles.append(getattr(layer, name).register_forward_hook(
+                _capture_hook(store, f"{tag}/{side_label}/{name}")
             ))
 
     # ----- inside self_attn -----
-    if hasattr(layer0, "self_attn"):
-        attn = layer0.self_attn
+    if hasattr(layer, "self_attn"):
+        attn = layer.self_attn
         attn_subs = ["q_a_proj", "q_a_norm", "q_b_proj", "q_b_norm",
                      "kv_proj", "kv_norm", "o_a_proj", "o_b_proj"]
         for name in attn_subs:
             if hasattr(attn, name):
                 handles.append(getattr(attn, name).register_forward_hook(
-                    _capture_hook(store, f"L0/{side_label}/self_attn.{name}")
+                    _capture_hook(store, f"{tag}/{side_label}/self_attn.{name}")
                 ))
         if hasattr(attn, "compressor") and attn.compressor is not None:
             handles.append(attn.compressor.register_forward_hook(
-                _capture_hook(store, f"L0/{side_label}/self_attn.compressor")
+                _capture_hook(store, f"{tag}/{side_label}/self_attn.compressor")
             ))
     return store, handles
 
@@ -136,6 +137,10 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--threshold", type=float, default=1e-5,
                         help="max_abs above which a capture point is flagged as 'diverged'.")
+    parser.add_argument("--sub-layer", type=int, default=0,
+                        help="Which decoder layer to expose sub-points for. "
+                             "Default 0; use e.g. --sub-layer 2 to drill into CSA "
+                             "if HCA layers 0-1 are byte-exact and divergence starts later.")
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args()
 
@@ -157,11 +162,11 @@ def main() -> int:
         print(f"      WARNING — missing={len(res.missing_keys)} unexpected={len(res.unexpected_keys)}; "
               "subsequent diff numbers may reflect that, not algorithmic drift.")
 
-    print("[2/3] Hooks: full pass + layer-0 sub-points ...", flush=True)
+    print(f"[2/3] Hooks: full pass + layer-{args.sub_layer:02d} sub-points ...", flush=True)
     hf_full, hf_handles_full = _attach_hooks_full(hf_model, num_layers)
     alloy_full, alloy_handles_full = _attach_hooks_full(alloy_model, num_layers)
-    hf_l0, hf_handles_l0 = _attach_hooks_layer0_sub(hf_model, "hf")
-    alloy_l0, alloy_handles_l0 = _attach_hooks_layer0_sub(alloy_model, "alloy")
+    hf_l0, hf_handles_l0 = _attach_hooks_layer_sub(hf_model, "hf", args.sub_layer)
+    alloy_l0, alloy_handles_l0 = _attach_hooks_layer_sub(alloy_model, "alloy", args.sub_layer)
 
     torch.manual_seed(args.seed)
     input_ids = torch.randint(
@@ -247,8 +252,9 @@ def main() -> int:
     print(f"{'sub-point':<32} {'shape':<28} {'max_abs':>12} {'mean_abs':>12}  flag")
     print("-" * 96)
     for sub in sub_keys:
-        hf_key = f"L0/hf/{sub}"
-        al_key = f"L0/alloy/{sub}"
+        sub_tag = f"L{args.sub_layer:02d}"
+        hf_key = f"{sub_tag}/hf/{sub}"
+        al_key = f"{sub_tag}/alloy/{sub}"
         if hf_key not in hf_l0 or al_key not in alloy_l0:
             continue
         ref, ours = hf_l0[hf_key], alloy_l0[al_key]
@@ -278,7 +284,7 @@ def main() -> int:
         elif first_div.startswith("layer_"):
             i = int(first_div.split("_")[-1])
             print(f"  layer {i} introduced drift (math is correct up to layer {i-1}).")
-            print("  Inspect the layer-0 sub-points above to localise within the layer.")
+            print(f"  Inspect the layer-{args.sub_layer:02d} sub-points above to localise within the layer.")
             if i > 0:
                 print(f"  Or: rerun with --seq-len 1 to simplify, then attach sub-hooks on layer {i}.")
         elif first_div == "hc_head":
