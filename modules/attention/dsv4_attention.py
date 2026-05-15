@@ -757,6 +757,15 @@ class DeepseekV4Attention(nn.Module):
         compressor_cls = _COMPRESSOR_CLASSES.get(self.layer_type)
         self.compressor = compressor_cls(config) if compressor_cls is not None else None
 
+        # DSV4 has two distinct rope theta bases (main / compress) for the
+        # sliding-window KV path vs the compressed-KV path. The model-level
+        # rotary builds cos/sin for both labels; per-layer attention picks the
+        # right one for its layer type. Mirrors HF main DeepseekV4Attention
+        # (modeling_deepseek_v4.py:765).
+        self.rope_layer_type = (
+            "main" if self.layer_type == "dsv4_sliding_attention" else "compress"
+        )
+
         # All three DSV4 attention flavours dispatch through alloy's
         # IMPL_REGISTRY so backend packages (hf-npu-binder, etc.) can swap
         # in faster kernels per layer type without touching HF's
@@ -776,7 +785,11 @@ class DeepseekV4Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        position_embeddings: (
+            dict[str, tuple[torch.Tensor, torch.Tensor]]
+            | tuple[torch.Tensor, torch.Tensor]
+            | None
+        ) = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         past_key_values: Cache | None = None,
@@ -785,8 +798,16 @@ class DeepseekV4Attention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         if position_embeddings is None:
-            raise ValueError("DeepseekV4Attention requires position_embeddings (cos, sin) tuple.")
-        cos, sin = position_embeddings
+            raise ValueError("DeepseekV4Attention requires position_embeddings.")
+        # HF main passes a dict keyed by rope-type label ({"main": ..., "compress": ...})
+        # so HCA/CSA can use the higher compress rope_theta while sliding stays on
+        # main rope. Accept the legacy single-tuple form too — that's what the
+        # generic alloy ``_call_rotary`` returns for non-DSV4 mixers; DSV4-family
+        # rotary now returns the dict so per-layer cos/sin matches HF.
+        if isinstance(position_embeddings, dict):
+            cos, sin = position_embeddings[self.rope_layer_type]
+        else:
+            cos, sin = position_embeddings
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)

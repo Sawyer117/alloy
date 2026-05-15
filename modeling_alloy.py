@@ -56,7 +56,16 @@ def _call_rotary(
     parametric :class:`RotaryEmbedding` doesn't have.
     """
     if hasattr(rotary_emb, "layer_types"):
-        return rotary_emb(hidden_states, position_ids, layer_type="main")
+        # DSV4-family rotary holds one inv_freq per rope-type label
+        # ("main" / "compress"). HF main DeepseekV4Model.forward builds a
+        # dict {label: (cos, sin)} and passes that to every layer; each
+        # DSV4 attention picks the right entry via ``self.rope_layer_type``
+        # (sliding -> main, HCA/CSA -> compress). Returning only "main"
+        # silently sends every HCA/CSA layer the wrong cos/sin.
+        return {
+            label: rotary_emb(hidden_states, position_ids, layer_type=label)
+            for label in rotary_emb.layer_types
+        }
     return rotary_emb(hidden_states, position_ids)
 # RMSNorm is the only non-stdlib module modeling_alloy *constructs directly*
 # (input_layernorm / post_attention_layernorm / final norm). All registered
