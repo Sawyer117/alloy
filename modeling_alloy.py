@@ -148,6 +148,15 @@ class AlloyDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         self.ffn_type = config.ffn_types[layer_idx]
+        self.residual_mode = getattr(config, "residual_mode", "pre_ln")
+        self.keel_alpha = (
+            float(config.keel_alpha)
+            if getattr(config, "keel_alpha", None) is not None
+            else float(2 * config.num_hidden_layers)
+        )
+        self.keel_first_sublayers_unscaled = bool(
+            getattr(config, "keel_first_sublayers_unscaled", True)
+        )
 
         mixer_entry = get_mixer(self.layer_type)
         self._mixer_attr = mixer_entry.attr_name
@@ -162,6 +171,13 @@ class AlloyDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
         )
+        if self.residual_mode == "keel":
+            self.attention_output_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
+            )
+            self.mlp_output_layernorm = RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, unit_offset=config.rms_norm_unit_offset
+            )
 
     @property
     def mixer(self) -> nn.Module:
@@ -177,6 +193,17 @@ class AlloyDecoderLayer(nn.Module):
         input_ids: torch.LongTensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        if self.residual_mode == "keel":
+            return self._forward_keel(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                position_embeddings=position_embeddings,
+                input_ids=input_ids,
+                **kwargs,
+            )
+
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -202,6 +229,57 @@ class AlloyDecoderLayer(nn.Module):
         if isinstance(ffn_out, tuple):
             ffn_out = ffn_out[0]
         hidden_states = residual + ffn_out
+        return hidden_states
+
+    def _forward_keel(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        input_ids: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Keel residual topology: ``LN(alpha*x + F(LN(x)))`` per sublayer.
+
+        The Keel paper counts attention and FFN as separate sublayers and sets
+        ``alpha = L`` where ``L = 2 * num_hidden_layers``. Its first attention
+        and first FFN sublayers omit the outer post-LN and shortcut scaling;
+        ``keel_first_sublayers_unscaled=True`` preserves that behaviour.
+        """
+        residual = hidden_states
+        mixer_out = self.mixer(
+            hidden_states=self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        if isinstance(mixer_out, tuple):
+            mixer_out = mixer_out[0]
+        if self.keel_first_sublayers_unscaled and self.layer_idx == 0:
+            hidden_states = residual + mixer_out
+        else:
+            hidden_states = self.attention_output_layernorm(
+                residual.mul(self.keel_alpha) + mixer_out
+            )
+
+        residual = hidden_states
+        # input_ids is forwarded uniformly; FFN classes that don't need it
+        # (Qwen3MLP, Qwen35SparseMoE) absorb it via **kwargs. Hash-routed
+        # MoE variants (DSV4 dsv4_hash_moe) read it to compute the
+        # tid2eid expert lookup.
+        ffn_out = self.mlp(self.post_attention_layernorm(hidden_states), input_ids=input_ids)
+        if isinstance(ffn_out, tuple):
+            ffn_out = ffn_out[0]
+        if self.keel_first_sublayers_unscaled and self.layer_idx == 0:
+            hidden_states = residual + ffn_out
+        else:
+            hidden_states = self.mlp_output_layernorm(
+                residual.mul(self.keel_alpha) + ffn_out
+            )
         return hidden_states
 
 

@@ -134,6 +134,8 @@ class AlloyConfig(PretrainedConfig):
         ),
         # architecture mix
         ("layer_types", "ffn_types"),
+        # residual topology (pre-LN default / Keel post-LN highway)
+        ("residual_mode", "keel_alpha", "keel_first_sublayers_unscaled"),
         # norm
         ("rms_norm_eps", "rms_norm_unit_offset"),
         # rotary
@@ -194,6 +196,10 @@ class AlloyConfig(PretrainedConfig):
         # per-layer architecture
         layer_types: list[str] | None = None,
         ffn_types: list[str] | None = None,
+        # residual topology
+        residual_mode: str = "pre_ln",
+        keel_alpha: float | None = None,
+        keel_first_sublayers_unscaled: bool = True,
         # rotary
         rope_parameters: dict | None = None,
         # GQA
@@ -262,6 +268,9 @@ class AlloyConfig(PretrainedConfig):
         self.rms_norm_unit_offset = rms_norm_unit_offset
         self.use_cache = use_cache
         self.hidden_act = hidden_act
+        self.residual_mode = residual_mode
+        self.keel_alpha = keel_alpha
+        self.keel_first_sublayers_unscaled = keel_first_sublayers_unscaled
 
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -327,6 +336,18 @@ class AlloyConfig(PretrainedConfig):
             )
 
         # Cross-field validation that doesn't need layer_types / ffn_types
+        if self.residual_mode not in {"pre_ln", "keel"}:
+            raise ValueError(
+                f"residual_mode must be 'pre_ln' or 'keel', got {self.residual_mode!r}"
+            )
+        if self.keel_alpha is not None and self.keel_alpha <= 0:
+            raise ValueError(f"keel_alpha must be positive when set, got {self.keel_alpha}")
+        if self.residual_mode == "keel" and self.use_mhc:
+            raise ValueError(
+                "residual_mode='keel' cannot be combined with use_mhc=True; "
+                "both change the residual topology. Run Keel and MHC as separate ablations."
+            )
+
         if self.num_attention_heads % self.num_key_value_heads != 0:
             raise ValueError(
                 f"num_attention_heads ({self.num_attention_heads}) must be divisible by "

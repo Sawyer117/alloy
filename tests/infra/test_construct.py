@@ -45,6 +45,31 @@ def _qwen3_like_config() -> AlloyConfig:
     )
 
 
+def _qwen3_keel_like_config() -> AlloyConfig:
+    """Small Qwen3-style model with Keel residual topology enabled."""
+    num_layers = 3
+    return AlloyConfig(
+        vocab_size=1024,
+        hidden_size=128,
+        num_hidden_layers=num_layers,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        intermediate_size=192,
+        max_position_embeddings=256,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        rms_norm_unit_offset=False,
+        attn_output_gate=False,
+        residual_mode="keel",
+        keel_alpha=None,
+        keel_first_sublayers_unscaled=True,
+        layer_types=["qwen3_attention"] * num_layers,
+        ffn_types=["qwen3_mlp"] * num_layers,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+
+
 def _qwen3_5_moe_like_config() -> AlloyConfig:
     """4 layers: [gdn, gdn, gdn, attn] × qwen3_5_moe FFN, gated attn, (1+w)-init RMSNorm.
 
@@ -130,7 +155,8 @@ def _run_json_roundtrip(config: AlloyConfig, tag: str) -> None:
 
     rebuilt = AlloyConfig(**raw)
     for field in ("vocab_size", "hidden_size", "num_hidden_layers",
-                  "layer_types", "ffn_types", "rms_norm_unit_offset",
+                  "layer_types", "ffn_types", "residual_mode", "keel_alpha",
+                  "keel_first_sublayers_unscaled", "rms_norm_unit_offset",
                   "attn_output_gate", "num_experts"):
         assert getattr(rebuilt, field) == getattr(config, field), (
             f"[{tag}] roundtrip mismatch on {field}: "
@@ -145,6 +171,41 @@ def test_qwen3_like_construct_and_roundtrip() -> None:
     _run_json_roundtrip(cfg, "qwen3-like")
 
 
+def test_qwen3_keel_like_construct_and_roundtrip() -> None:
+    cfg = _qwen3_keel_like_config()
+    _run_forward(cfg, "qwen3-keel-like")
+    _run_json_roundtrip(cfg, "qwen3-keel-like")
+
+    model = AlloyForCausalLM(cfg).eval()
+    first_layer = model.model.layers[0]
+    second_layer = model.model.layers[1]
+    assert first_layer.residual_mode == "keel"
+    assert first_layer.keel_alpha == float(2 * cfg.num_hidden_layers)
+    assert hasattr(first_layer, "attention_output_layernorm")
+    assert hasattr(second_layer, "mlp_output_layernorm")
+
+
+def test_keel_rejects_mhc_combo() -> None:
+    try:
+        AlloyConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            intermediate_size=128,
+            layer_types=["qwen3_attention"],
+            ffn_types=["qwen3_mlp"],
+            residual_mode="keel",
+            use_mhc=True,
+        )
+    except ValueError as e:
+        assert "cannot be combined with use_mhc=True" in str(e), e
+        return
+    raise AssertionError("expected Keel + MHC config to be rejected")
+
+
 def test_qwen3_5_moe_like_construct_and_roundtrip() -> None:
     cfg = _qwen3_5_moe_like_config()
     _run_forward(cfg, "qwen3.5-MoE-like")
@@ -153,6 +214,8 @@ def test_qwen3_5_moe_like_construct_and_roundtrip() -> None:
 
 def main() -> int:
     test_qwen3_like_construct_and_roundtrip()
+    test_qwen3_keel_like_construct_and_roundtrip()
+    test_keel_rejects_mhc_combo()
     test_qwen3_5_moe_like_construct_and_roundtrip()
     print("\nAll smoke tests passed.")
     return 0
