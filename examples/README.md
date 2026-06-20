@@ -25,9 +25,9 @@ Shipped configs:
 | `configs/qwen3_4b.json` | Qwen3-4B | 36 × `qwen3_attention` + `qwen3_mlp`, tied embeddings |
 | `configs/qwen3_5_35b_a3b.json` | Qwen3.5-35B-A3B | 40 layers, 3:1 `qwen3_5_gdn` to `qwen3_attention`, `qwen3_5_moe` FFN throughout, attn output gate + unit-offset RMSNorm + partial rotary + mRoPE |
 | `configs/qwen3_340m_dense.json` | from scratch | 24-block Qwen3-style dense Pre-LN baseline, hidden 1024 |
-| `configs/qwen3_340m_dense_keel.json` | from scratch | shape-matched 24-block Keel residual topology baseline |
-| `configs/qwen3_340m_deep_preln_32b.json` | from scratch | 32-block deep/narrow Pre-LN baseline, hidden 1024, intermediate 1920 |
-| `configs/qwen3_340m_deep_keel_32b.json` | from scratch | shape-matched 32-block deep/narrow Keel residual topology baseline |
+| `configs/keel/qwen3_340m_dense_keel.json` | from scratch | shape-matched 24-block Keel residual topology baseline |
+| `configs/keel/qwen3_340m_deep_preln_32b.json` | from scratch | 32-block deep/narrow Pre-LN baseline, hidden 1024, intermediate 1920 |
+| `configs/keel/qwen3_340m_deep_keel_32b.json` | from scratch | shape-matched 32-block deep/narrow Keel residual topology baseline |
 
 ```bash
 # plain full-attention path:
